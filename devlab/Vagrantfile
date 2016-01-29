@@ -97,6 +97,7 @@ Vagrant.configure(2) do |config|
             thisnode.vm.provision "shell", path: "./provision/cleanup_nova_instances.sh"
           end
           thisnode.vm.provision "shell", path: "./provision/libvirt.sh"
+        thisnode.vm.provision "shell", path: "./provision/restart_openstack_services.sh"
         when "lab"
           thisnode.vm.provision "shell",
             path: "./provision/cloudferry.sh"

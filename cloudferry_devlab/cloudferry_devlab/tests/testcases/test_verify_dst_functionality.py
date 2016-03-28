@@ -95,7 +95,7 @@ class VerifyDstCloudFunctionality(functional_test.FunctionalTest):
 
         self.external_networks_ids_list = (
             [i['id'] for i in self.dst_cloud.neutronclient.list_networks(
-            )['networks'] if i.get('router:external') is True])
+            )['networks'] if i.get('name') == 'shared_net'])
 
         fip = self.dst_cloud.neutronclient.create_floatingip(
             {"floatingip": {"floating_network_id":

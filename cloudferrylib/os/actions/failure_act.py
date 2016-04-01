@@ -13,15 +13,16 @@
 # limitations under the License.
 
 from cloudferrylib.base.action import action
-from cloudferrylib.utils import utils
+from cloudferrylib.utils import log
 
 
-LOG = utils.get_log(__name__)
+LOG = log.getLogger(__name__)
 
 
 class DivisionByZero(action.Action):
 
     def run(self, *args, **kwargs):
-        LOG.debug("Dividing by zero (special case to fail migration execution)")
+        LOG.debug("Dividing by zero "
+                  "(special case to fail migration execution)")
         a = 1 / 0
         return a

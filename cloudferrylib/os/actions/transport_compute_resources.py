@@ -16,14 +16,15 @@ import copy
 from cloudferrylib.base.action import action
 from cloudferrylib.os.compute import keypairs
 from cloudferrylib.os.identity import keystone
+from cloudferrylib.utils import log
 from cloudferrylib.utils import utils as utl
 
 
-LOG = utl.get_log(__name__)
+LOG = log.getLogger(__name__)
 
 
 class TransportComputeResources(action.Action):
-    def run(self, info=None, identity_info=None, **kwargs):
+    def run(self, info=None, **kwargs):
         info = copy.deepcopy(info)
         target = 'resources'
         search_opts = {'target': target}
@@ -33,8 +34,12 @@ class TransportComputeResources(action.Action):
         dst_compute = self.dst_cloud.resources[utl.COMPUTE_RESOURCE]
 
         info_res = src_compute.read_info(**search_opts)
+
+        tenant_map = self.get_similar_tenants()
+        user_map = self.get_similar_users()
+
         new_info = dst_compute.deploy(info_res, target=target,
-                                      identity_info=identity_info)
+                                      tenant_map=tenant_map, user_map=user_map)
 
         if info:
             new_info[utl.INSTANCES_TYPE] = info[utl.INSTANCES_TYPE]
@@ -91,12 +96,21 @@ class TransportKeyPairs(action.Action):
         src_keystone = self.src_cloud.resources[utl.IDENTITY_RESOURCE]
         dst_keystone = self.dst_cloud.resources[utl.IDENTITY_RESOURCE]
 
+        dst_users = {}
         key_pairs = self.kp_db_broker.get_all_keypairs(self.src_cloud)
 
+        # If we want to skip orphaned key pairs - we should not switch
+        # to the admin if dst_user doesn't exist
+        fallback_to_admin = not self.cfg.migrate.skip_orphaned_keypairs
+
         for key_pair in key_pairs:
-            dst_user = keystone.get_dst_user_from_src_user_id(
-                src_keystone, dst_keystone, key_pair.user_id,
-                fallback_to_admin=True)
+            if key_pair.user_id not in dst_users:
+                dst_user = keystone.get_dst_user_from_src_user_id(
+                    src_keystone, dst_keystone, key_pair.user_id,
+                    fallback_to_admin=fallback_to_admin)
+                dst_users[key_pair.user_id] = dst_user
+            else:
+                dst_user = dst_users[key_pair.user_id]
             if dst_user is None:
                 continue
 

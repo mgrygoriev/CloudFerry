@@ -1,5 +1,21 @@
-from oslo.config import cfg
-import addons
+# Copyright (c) 2016 Mirantis Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the License);
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an AS IS BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+# implied.
+# See the License for the specific language governing permissions and#
+# limitations under the License.
+
+
+from oslo_config import cfg
+
+
 src = cfg.OptGroup(name='src',
                    title='Credentials and general config for source cloud')
 
@@ -10,22 +26,26 @@ src_opts = [
                help='Keystone service endpoint for authorization'),
     cfg.StrOpt('host', default='-',
                help='ip-address controller for cloud'),
-    cfg.StrOpt('ssh_host', default='',
+    cfg.StrOpt('ssh_host', default=None,
                help='ip-address of cloud node for ssh connect'),
-    cfg.StrOpt('ext_cidr', default='',
-               help='external network CIDR'),
+    cfg.ListOpt('ext_cidr', default=[], help='external network CIDR'),
     cfg.StrOpt('user', default='-',
                help='user for access to API'),
     cfg.StrOpt('password', default='-',
                help='password for access to API'),
     cfg.StrOpt('tenant', default='-',
                help='tenant for access to API'),
+    cfg.StrOpt('region', default=None,
+               help='Openstack region name'),
     cfg.StrOpt('service_tenant', default='service',
                help='Tenant name for services'),
     cfg.StrOpt('ssh_user', default='root',
                help='user to connect via ssh'),
     cfg.StrOpt('ssh_sudo_password', default='',
-               help='sudo password to connect via ssh, if any')
+               help='sudo password to connect via ssh, if any'),
+    cfg.StrOpt('cacert', default='', help='SSL certificate'),
+    cfg.BoolOpt('insecure', default=False,
+                help='Allow to access servers without checking SSL certs')
 ]
 
 dst = cfg.OptGroup(name='dst',
@@ -39,22 +59,26 @@ dst_opts = [
                help='Keystone service endpoint for authorization'),
     cfg.StrOpt('host', default='-',
                help='ip-address controller for cloud'),
-    cfg.StrOpt('ssh_host', default='',
+    cfg.StrOpt('ssh_host', default=None,
                help='ip-address of cloud node for ssh connect'),
-    cfg.StrOpt('ext_cidr', default='',
-               help='external network CIDR'),
+    cfg.ListOpt('ext_cidr', default=[], help='external network CIDR'),
     cfg.StrOpt('user', default='-',
                help='user for access to API'),
     cfg.StrOpt('password', default='-',
                help='password for access to API'),
     cfg.StrOpt('tenant', default='-',
                help='tenant for access to API'),
+    cfg.StrOpt('region', default=None,
+               help='Openstack region name'),
     cfg.StrOpt('service_tenant', default='service',
                help='Tenant name for services'),
     cfg.StrOpt('ssh_user', default='root',
                help='user to connect via ssh'),
     cfg.StrOpt('ssh_sudo_password', default='',
-               help='sudo password to connect via ssh, if any')
+               help='sudo password to connect via ssh, if any'),
+    cfg.StrOpt('cacert', default='', help='SSL certificate'),
+    cfg.BoolOpt('insecure', default=False,
+                help='Allow to access servers without checking SSL certs')
 ]
 
 migrate = cfg.OptGroup(name='migrate',
@@ -62,32 +86,40 @@ migrate = cfg.OptGroup(name='migrate',
 
 migrate_opts = [
     cfg.BoolOpt('keep_user_passwords', default=True,
-               help='True - keep user passwords, '
-                    'False - not keep user passwords'),
-    cfg.StrOpt('key_filename', default='id_rsa',
-               help='name pub key'),
+                help='True - keep user passwords, '
+                     'False - not keep user passwords'),
+    cfg.ListOpt('key_filename', default=['id_rsa'],
+                help='private key(s) for interaction with clouds via ssh'),
     cfg.BoolOpt('keep_ip', default=False,
-               help='yes - keep ip, no - not keep ip'),
+                help='yes - keep ip, no - not keep ip'),
     cfg.BoolOpt('migrate_extnets', default=False,
-               help='yes - migrate external networks, no - do not migrate external networks'),
+                help='yes - migrate external networks, '
+                     'no - do not migrate external networks'),
     cfg.StrOpt('ext_net_map', default='configs/ext_net_map.yaml',
                help='path to the map of external networks, which contains '
                     'references between old and new ids'),
     cfg.BoolOpt('keep_floatingip', default=False,
-               help='yes - keep floatingip, no - not keep floatingip'),
-    cfg.StrOpt('cinder_migration_strategy',
-               default='cloudferrylib.os.storage.cinder_storage.CinderStorage',
-               help='path to class that will perform cinder migration actions'),
+                help='yes - keep floatingip, no - not keep floatingip'),
+    cfg.BoolOpt('change_router_ips', default=False,
+                help='change router external ip on dst cloud to '
+                     'avoid ip collision by making additional floatingip '
+                     'on dst as stub'),
+    cfg.BoolOpt('clean_router_ips_stub', default=False,
+                help='delete floating ip stub on dst after router migration'),
+    cfg.StrOpt('router_ips_stub_tenant', default=None,
+               help='tenant for creation router ip stubs, if it "None" as '
+                    'default stub creates in router tenant'),
     cfg.BoolOpt('keep_lbaas', default=False,
-               help='yes - keep lbaas settings, no - not keep lbaas settings'),
+                help='yes - keep lbaas settings, '
+                     'no - not keep lbaas settings'),
     cfg.BoolOpt('keep_volume_snapshots', default=False,
-               help='yes - keep volume snapshots, no - not keep volume snapshots'),
+                help='yes - keep volume snapshots, '
+                     'no - not keep volume snapshots'),
     cfg.BoolOpt('keep_volume_storage', default=False,
-               help='True - keep volume_storage, False - not keep volume_storage'),
-    cfg.StrOpt('speed_limit', default='10MB',
+                help='True - keep volume_storage, '
+                     'False - not keep volume_storage'),
+    cfg.StrOpt('speed_limit', default='off',
                help='speed limit for glance to glance'),
-    cfg.StrOpt('instances', default='key_name-qwerty',
-               help='filter instance by parameters'),
     cfg.StrOpt('file_compression', default='dd',
                help='gzip - use GZIP when file transferring via ssh, '
                     ' - no compression, directly via dd'),
@@ -106,9 +138,11 @@ migrate_opts = [
     cfg.StrOpt('container_format', default='bare',
                help='container format when covert volume to image'),
     cfg.BoolOpt('direct_compute_transfer', default=False,
-                help='Direct data transmission between compute nodes via external network'),
+                help='Direct data transmission between compute nodes '
+                     'via external network'),
     cfg.StrOpt('filter_path', default='configs/filter.yaml',
-               help='path to the filter yaml file with options for search resources'),
+               help='path to the filter yaml file with options '
+                    'for search resources'),
     cfg.IntOpt('retry', default='7',
                help='Number retry if except Performing error'),
     cfg.IntOpt('time_wait', default=5,
@@ -117,10 +151,6 @@ migrate_opts = [
                help='Size of one chunk to transfer via SSH'),
     cfg.StrOpt('group_file_path', default="vm_groups.yaml",
                help='Path to file with the groups of VMs'),
-    cfg.BoolOpt('skip_down_hosts', default=True,
-                help="If set to True, removes unreachable compute hosts from "
-                     "nova hypervisor list. Otherwise migration process fails "
-                     "with unrecoverable error if host is down."),
     cfg.StrOpt('scenario', default='scenario/migrate.yaml',
                help='Path to a scenario file, which holds the whole migration '
                     'procedure. Must be YAML format'),
@@ -136,7 +166,65 @@ migrate_opts = [
                      'OpenStack does not support user quotas (e.g. Grizzly)'),
     cfg.StrOpt('incloud_live_migration', default='nova',
                help='Live migration type used for in-cloud live migration. '
-                    'Possible values: "nova", "cobalt".')
+                    'Possible values: "nova", "cobalt".'),
+    cfg.StrOpt('mysqldump_host',
+               help='IP or hostname used for creating MySQL dump for rollback.'
+                    'If not set uses `[dst] db_host` config option.'),
+    cfg.BoolOpt('optimize_user_role_fetch', default=True,
+                help="Uses low-level DB requests if set to True, "
+                "may be incompatible with more recent versions of "
+                "Keystone. Tested on grizzly, icehouse and juno."),
+    cfg.IntOpt('ssh_connection_attempts', default=3,
+               help='Number of times CloudFerry will attempt to connect when '
+                    'connecting to a new server via SSH.'),
+    cfg.BoolOpt('ignore_empty_images',
+                help='Ignore images with size 0 and exclude them from '
+                     'migration process', default=False),
+    cfg.BoolOpt('hide_ssl_warnings', default=False,
+                help="Don't show ssl warnings"),
+    cfg.BoolOpt('keep_affinity_settings', default=False,
+                help="Keep affinity/anti-affinity settings"),
+    cfg.IntOpt('boot_timeout', default=300,
+               help="Timeout booting of instance"),
+    cfg.StrOpt('ssh_cipher', default=None, help='SSH cipher to use for SCP'),
+    cfg.StrOpt('copy_backend', default="rsync",
+               help="Allows to choose how ephemeral storage and cinder "
+                    "volumes are copied over from source to destination. "
+                    "Possible values: 'rsync' (default), 'scp' and 'bbcp'. "
+                    "scp seem to be faster, while rsync is more reliable, "
+                    "but bbcp works in multithreading mode."),
+    cfg.BoolOpt('copy_with_md5_verification', default=True,
+                help="Calculate md5 checksum for source and copied files and "
+                     "verify them."),
+    cfg.StrOpt('log_config', default='configs/logging_config.yaml',
+               help='The path of a logging configuration file.'),
+    cfg.BoolOpt('forward_stdout', default=True,
+                help="Forward messages from stdout to log."),
+    cfg.BoolOpt('debug', default=False,
+                help="Print debugging output (set logging level to DEBUG "
+                     "instead of default INFO level)."),
+    cfg.BoolOpt('keep_network_interfaces_order', default=True,
+                help="Keep the order of network interfaces of instances."),
+    cfg.IntOpt('num_processes_for_volume_migration', default=5,
+               help="Defines number of parallel processes for cinder volume "
+                    "migration process. Does not parallelize migration of "
+                    "other resources."),
+    cfg.StrOpt('local_sudo_password', default=None,
+               help='Password to be used for sudo command if needed on the '
+                    'local host'),
+    cfg.IntOpt('storage_backend_timeout', default=300,
+               help='Time to wait for cinder volume backend to complete '
+                    'typical action, like create or delete simple volume. '
+                    'Value is in seconds.'),
+    cfg.BoolOpt('keep_usage_quotas_inst', default=True,
+                help="Keep the usage quotas for instances."),
+    cfg.BoolOpt('skip_orphaned_keypairs', default=True,
+                help="If it is set to False - key pairs belonging to deleted "
+                     "tenant or to deleted user on SRC will be assigned to "
+                     "the admin on DST, otherwise skipped."),
+    cfg.StrOpt('override_rules', default=None,
+               help='Server creation parameter (e.g. server group) override '
+                    'rules file path.'),
 ]
 
 mail = cfg.OptGroup(name='mail',
@@ -157,15 +245,15 @@ src_mysql = cfg.OptGroup(name='src_mysql',
                          title='Config mysql for source cloud')
 
 src_mysql_opts = [
-    cfg.StrOpt('user', default='-',
+    cfg.StrOpt('db_user', default='-',
                help='user for mysql'),
-    cfg.StrOpt('password', default='-',
+    cfg.StrOpt('db_password', default='-',
                help='password for mysql'),
-    cfg.StrOpt('host', default='-',
+    cfg.StrOpt('db_host', default='-',
                help='host of mysql'),
-    cfg.IntOpt('port', default='3306',
+    cfg.IntOpt('db_port', default=3306,
                help='port for mysql connection'),
-    cfg.StrOpt('connection', default='mysql+mysqlconnector',
+    cfg.StrOpt('db_connection', default='mysql+pymysql',
                help='driver for connection'),
 ]
 
@@ -190,27 +278,23 @@ src_compute_opts = [
                help='name service for compute'),
     cfg.StrOpt('backend', default='ceph',
                help='backend for ephemeral drives'),
-    cfg.StrOpt('convert_diff_file', default='qcow2',
-               help='convert diff file to'),
-    cfg.StrOpt('convert_ephemeral_disk', default='qcow2',
-               help='convert ephemeral disk to'),
     cfg.BoolOpt('disk_overcommit', default=False,
                 help='live-migration allow disk overcommit'),
     cfg.BoolOpt('block_migration', default=False,
                 help='live-migration without shared_storage'),
     cfg.StrOpt('host_eph_drv', default='-',
                help='host ephemeral drive'),
-    cfg.StrOpt('connection', default='mysql+mysqlconnector',
+    cfg.StrOpt('db_connection', default='mysql+pymysql',
                help='driver for db connection'),
-    cfg.StrOpt('host', default='',
+    cfg.StrOpt('db_host', default=None,
                help='compute mysql node ip address'),
-    cfg.IntOpt('port', default='3306',
+    cfg.IntOpt('db_port', default=3306,
                help='port for mysql connection'),
-    cfg.StrOpt('database_name', default='',
+    cfg.StrOpt('db_name', default=None,
                help='compute database name'),
-    cfg.StrOpt('user', default='',
+    cfg.StrOpt('db_user', default=None,
                help='user for db access'),
-    cfg.StrOpt('password', default='',
+    cfg.StrOpt('db_password', default=None,
                help='password for db access'),
 ]
 
@@ -221,30 +305,61 @@ src_storage = cfg.OptGroup(name='src_storage',
 src_storage_opts = [
     cfg.StrOpt('service', default='cinder',
                help='name service for storage'),
-    cfg.StrOpt('backend', default='iscsi',
-               help='backend for storage'),
-    cfg.StrOpt('host', default='',
+    cfg.StrOpt('backend', default='nfs',
+               help='Cinder volume backend. Possible values: nfs, iscsi-vmax'),
+    cfg.StrOpt('host', default=None,
                help='storage node ip address'),
-    cfg.IntOpt('port', default='3306',
+    cfg.StrOpt('db_host', default=None,
+               help='storage service db ip address'),
+    cfg.IntOpt('db_port', default=3306,
                help='port for mysql connection'),
-    cfg.StrOpt('user', default='',
+    cfg.StrOpt('db_user', default=None,
                help='user for db access (if backend == db)'),
-    cfg.StrOpt('password', default='',
+    cfg.StrOpt('db_password', default=None,
                help='password for db access (if backend == db)'),
-    cfg.StrOpt('database_name', default='',
+    cfg.StrOpt('db_name', default=None,
                help='cinder_database name (if backend == db)'),
-    cfg.StrOpt('connection', default='mysql+mysqlconnector',
+    cfg.StrOpt('db_connection', default=None,
                help='driver for connection'),
     cfg.StrOpt('protocol_transfer', default='GLANCE',
                help='mode transporting volumes GLANCE or SSH'),
     cfg.StrOpt('disk_format', default='qcow2',
                help='convert volume'),
-    cfg.StrOpt('volume_name_template', default='volume-',
-               help='template for creating names of volumes on storage backend'),
     cfg.StrOpt('rbd_pool', default='volumes',
                help='name of pool for volumes in Ceph RBD storage'),
     cfg.StrOpt('snapshot_name_template', default='snapshot-',
-               help='template for creating names of snapshots on storage backend')
+               help='template for creating names of snapshots '
+                    'on storage backend'),
+    cfg.StrOpt('conf', default='/etc/cinder/cinder.conf',
+               help="Path to cinder config file"),
+    cfg.StrOpt('vmax_ip', default=None,
+               help='IP address or hostname of EMC VMAX storage. Used with '
+                    '"vmax" backend'),
+    cfg.StrOpt('vmax_port', default=None,
+               help='IP port of EMC VMAX storage. Used with "vmax" backend'),
+    cfg.StrOpt('vmax_user', default=None,
+               help='Username to access EMC VMAX APIs. Used with "vmax" '
+                    'backend'),
+    cfg.StrOpt('vmax_password', default=None,
+               help='Pasword required to access EMC VMAX APIs. Used with '
+                    '"vmax" backend'),
+    cfg.ListOpt('vmax_port_groups', default=None,
+                help='Port group used for EMC VMAX'),
+    cfg.StrOpt('vmax_fast_policy', default=None,
+               help='Fast policy for EMC VMAX'),
+    cfg.StrOpt('vmax_pool_name', default=None,
+               help='Pool name for EMC VMAX'),
+    cfg.StrOpt('volume_name_template', default='volume-%s',
+               help="Represents volume_name_template cinder config value. "
+                    "Volume files will be stored following the pattern."),
+    cfg.StrOpt('iscsi_my_ip', default=None,
+               help="Local host IP address which is used to connect to iSCSI "
+                    "target"),
+    cfg.ListOpt('nfs_mount_point_bases', default=['/var/lib/cinder'],
+                help="Represents nfs_mount_point_base cinder config option. "
+                     "Defines list of paths where volume files are created."),
+    cfg.StrOpt('initiator_name', default=None,
+               help="InitiatorName from /etc/iscsi/initiatorname.iscsi")
 ]
 
 src_image = cfg.OptGroup(name='src_image',
@@ -253,17 +368,17 @@ src_image = cfg.OptGroup(name='src_image',
 src_image_opts = [
     cfg.StrOpt('service', default='glance',
                help='name service for images'),
-    cfg.StrOpt('user', default='',
+    cfg.StrOpt('db_user', default=None,
                help='user for db access (if backend == db)'),
-    cfg.StrOpt('host', default='',
+    cfg.StrOpt('db_host', default=None,
                help='glance mysql node ip address'),
-    cfg.IntOpt('port', default='3306',
+    cfg.IntOpt('db_port', default=3306,
                help='port for mysql connection'),
-    cfg.StrOpt('password', default='',
+    cfg.StrOpt('db_password', default=None,
                help='password for db access (if backend == db)'),
-    cfg.StrOpt('database_name', default='',
+    cfg.StrOpt('db_name', default=None,
                help='glance_database name (if backend == db)'),
-    cfg.StrOpt('connection', default='mysql+mysqlconnector',
+    cfg.StrOpt('db_connection', default=None,
                help='driver for connection'),
     cfg.StrOpt('backend', default='file',
                help='backend for images')
@@ -273,8 +388,21 @@ src_identity = cfg.OptGroup(name='src_identity',
                             title='Config service for identity')
 
 src_identity_opts = [
+    cfg.StrOpt('db_user', default=None,
+               help='user for mysql'),
+    cfg.StrOpt('db_password', default=None,
+               help='password for mysql'),
+    cfg.StrOpt('db_host', default=None,
+               help='host of mysql'),
+    cfg.IntOpt('db_port', default=3306,
+               help='port for mysql connection'),
+    cfg.StrOpt('db_connection', default=None,
+               help='driver for connection'),
     cfg.StrOpt('service', default='keystone',
-               help='name service for keystone')
+               help='name service for keystone'),
+    cfg.StrOpt('db_name', default='',
+               help='database name')
+
 ]
 
 
@@ -285,18 +413,22 @@ src_network_opts = [
     cfg.StrOpt('service', default='auto',
                help='name service for network, '
                     'auto - detect avaiable service'),
-    cfg.StrOpt('host', default='localhost',
+    cfg.StrOpt('db_host', default=None,
                help='Neutron DB node host'),
-    cfg.IntOpt('port', default='3306',
+    cfg.IntOpt('db_port', default=3306,
                help='port for mysql connection'),
-    cfg.StrOpt('password', default='',
+    cfg.StrOpt('db_password', default=None,
                help='Neutron DB password'),
-    cfg.StrOpt('database_name', default='neutron',
+    cfg.StrOpt('db_name', default=None,
                help='Neutron database name'),
-    cfg.StrOpt('connection', default='mysql+mysqlconnector',
+    cfg.StrOpt('db_connection', default=None,
                help='Neutron DB connection type'),
-    cfg.StrOpt('user', default="root",
-               help="DB user for the networking backend")
+    cfg.StrOpt('db_user', default=None,
+               help="DB user for the networking backend"),
+    cfg.StrOpt('get_all_quota', default=False,
+               help="If False, then qoutas will be taken only customs,"
+                    " else All quotas including default and custom")
+
 ]
 
 src_objstorage = cfg.OptGroup(name='src_objstorage',
@@ -304,22 +436,24 @@ src_objstorage = cfg.OptGroup(name='src_objstorage',
 
 src_objstorage_opts = [
     cfg.StrOpt('service', default='swift',
-               help='service name for object storage')
+               help='service name for object storage'),
+    cfg.StrOpt('db_name', default='',
+               help='database name'),
 ]
 
 dst_mysql = cfg.OptGroup(name='dst_mysql',
                          title='Config mysql for destination cloud')
 
 dst_mysql_opts = [
-    cfg.StrOpt('user', default='-',
+    cfg.StrOpt('db_user', default='-',
                help='user for mysql'),
-    cfg.StrOpt('password', default='-',
+    cfg.StrOpt('db_password', default='-',
                help='password for mysql'),
-    cfg.StrOpt('host', default='-',
+    cfg.StrOpt('db_host', default='-',
                help='host of mysql'),
-    cfg.IntOpt('port', default='3306',
+    cfg.IntOpt('db_port', default=3306,
                help='port for mysql connection'),
-    cfg.StrOpt('connection', default='mysql+mysqlconnector',
+    cfg.StrOpt('db_connection', default='mysql+pymysql',
                help='driver for connection'),
 ]
 
@@ -332,7 +466,9 @@ dst_rabbit_opts = [
     cfg.StrOpt('password', default='guest',
                help='password for RabbitMQ'),
     cfg.StrOpt('hosts', default='-',
-               help='comma separated RabbitMQ hosts')
+               help='comma separated RabbitMQ hosts'),
+    cfg.StrOpt('db_name', default=None,
+               help='database name'),
 ]
 
 
@@ -344,14 +480,10 @@ dst_compute_opts = [
                help='name service for compute'),
     cfg.StrOpt('backend', default='ceph',
                help='backend for ephemeral drives'),
-    cfg.StrOpt('convert_diff_file', default='qcow2',
-               help='convert diff file to'),
-    cfg.StrOpt('convert_ephemeral_disk', default='qcow2',
-               help='convert ephemeral disk to'),
     cfg.BoolOpt('disk_overcommit', default=False,
-               help='live-migration allow disk overcommit'),
+                help='live-migration allow disk overcommit'),
     cfg.BoolOpt('block_migration', default=False,
-               help='live-migration without shared_storage'),
+                help='live-migration without shared_storage'),
     cfg.StrOpt('host_eph_drv', default='-',
                help='host ephemeral drive'),
     cfg.FloatOpt('cpu_allocation_ratio', default='16',
@@ -360,17 +492,17 @@ dst_compute_opts = [
                  help='ram allocation ratio'),
     cfg.FloatOpt('disk_allocation_ratio', default='0.9',
                  help='disk allocation ratio'),
-    cfg.StrOpt('connection', default='mysql+mysqlconnector',
+    cfg.StrOpt('db_connection', default=None,
                help='driver for db connection'),
-    cfg.StrOpt('host', default='',
+    cfg.StrOpt('db_host', default=None,
                help='compute mysql node ip address'),
-    cfg.IntOpt('port', default='3306',
+    cfg.IntOpt('db_port', default=3306,
                help='port for mysql connection'),
-    cfg.StrOpt('database_name', default='',
+    cfg.StrOpt('db_name', default=None,
                help='compute database name'),
-    cfg.StrOpt('user', default='',
+    cfg.StrOpt('db_user', default=None,
                help='user for db access'),
-    cfg.StrOpt('password', default='',
+    cfg.StrOpt('db_password', default=None,
                help='password for db access'),
 ]
 
@@ -381,30 +513,61 @@ dst_storage = cfg.OptGroup(name='dst_storage',
 dst_storage_opts = [
     cfg.StrOpt('service', default='cinder',
                help='name service for storage'),
-    cfg.StrOpt('backend', default='iscsi',
-               help='backend for storage'),
-    cfg.StrOpt('host', default='',
+    cfg.StrOpt('backend', default='nfs',
+               help='Cinder volume backend. Possible values: nfs, iscsi-vmax'),
+    cfg.StrOpt('host', default=None,
                help='storage node ip address'),
-    cfg.IntOpt('port', default='3306',
+    cfg.StrOpt('db_host', default=None,
+               help='storage service db ip address'),
+    cfg.IntOpt('db_port', default=3306,
                help='port for mysql connection'),
-    cfg.StrOpt('user', default='',
+    cfg.StrOpt('db_user', default=None,
                help='user for db access (if backend == db)'),
-    cfg.StrOpt('password', default='',
+    cfg.StrOpt('db_password', default=None,
                help='password for db access (if backend == db)'),
-    cfg.StrOpt('database_name', default='',
+    cfg.StrOpt('db_name', default=None,
                help='cinder_database name (if backend == db)'),
-    cfg.StrOpt('connection', default='mysql+mysqlconnector',
+    cfg.StrOpt('db_connection', default=None,
                help='driver for connection'),
     cfg.StrOpt('protocol_transfer', default='GLANCE',
                help='mode transporting volumes GLANCE or SSH'),
     cfg.StrOpt('disk_format', default='qcow2',
                help='convert volume'),
-    cfg.StrOpt('volume_name_template', default='volume-',
-               help='template for creating names of volumes on storage backend'),
     cfg.StrOpt('rbd_pool', default='volumes',
                help='name of pool for volumes in Ceph RBD storage'),
     cfg.StrOpt('snapshot_name_template', default='snapshot-',
-               help='template for creating names of snapshots on storage backend')
+               help='template for creating names of snapshots '
+                    'on storage backend'),
+    cfg.StrOpt('conf', default='/etc/cinder/cinder.conf',
+               help="Path to cinder config file"),
+    cfg.StrOpt('vmax_ip', default=None,
+               help='IP address or hostname of EMC VMAX storage. Used with '
+                    '"vmax" backend'),
+    cfg.StrOpt('vmax_port', default=None,
+               help='IP port of EMC VMAX storage. Used with "vmax" backend'),
+    cfg.StrOpt('vmax_user', default=None,
+               help='Username to access EMC VMAX APIs. Used with "vmax" '
+                    'backend'),
+    cfg.StrOpt('vmax_password', default=None,
+               help='Pasword required to access EMC VMAX APIs. Used with '
+                    '"vmax" backend'),
+    cfg.ListOpt('vmax_port_groups', default=None,
+                help='Port group used for EMC VMAX'),
+    cfg.StrOpt('vmax_fast_policy', default=None,
+               help='Fast policy for EMC VMAX'),
+    cfg.StrOpt('vmax_pool_name', default=None,
+               help='Pool name for EMC VMAX'),
+    cfg.StrOpt('volume_name_template', default='volume-%s',
+               help="Represents volume_name_template cinder config value. "
+                    "Volume files will be stored following the pattern."),
+    cfg.StrOpt('iscsi_my_ip', default=None,
+               help="Local host IP address which is used to connect to iSCSI "
+                    "target"),
+    cfg.ListOpt('nfs_mount_point_bases', default=['/var/lib/cinder'],
+                help="Represents nfs_mount_point_base cinder config option. "
+                     "Defines list of paths where volume files are created."),
+    cfg.StrOpt('initiator_name', default=None,
+               help="InitiatorName from /etc/iscsi/initiatorname.iscsi")
 ]
 
 dst_image = cfg.OptGroup(name='dst_image',
@@ -415,17 +578,17 @@ dst_image_opts = [
                help='name service for images'),
     cfg.BoolOpt('convert_to_raw', default='True',
                 help='convert to raw images'),
-    cfg.StrOpt('host', default='',
+    cfg.StrOpt('db_host', default=None,
                help='glance mysql node ip address'),
-    cfg.IntOpt('port', default='3306',
+    cfg.IntOpt('db_port', default=3306,
                help='port for mysql connection'),
-    cfg.StrOpt('user', default='',
+    cfg.StrOpt('db_user', default=None,
                help='user for db access (if backend == db)'),
-    cfg.StrOpt('password', default='',
+    cfg.StrOpt('db_password', default=None,
                help='password for db access (if backend == db)'),
-    cfg.StrOpt('database_name', default='',
+    cfg.StrOpt('db_name', default=None,
                help='glance_database name (if backend == db)'),
-    cfg.StrOpt('connection', default='mysql+mysqlconnector',
+    cfg.StrOpt('db_connection', default=None,
                help='driver for connection'),
     cfg.StrOpt('backend', default='file',
                help='backend for images')
@@ -435,8 +598,20 @@ dst_identity = cfg.OptGroup(name='dst_identity',
                             title='Config service for identity')
 
 dst_identity_opts = [
+    cfg.StrOpt('db_user', default=None,
+               help='user for mysql'),
+    cfg.StrOpt('db_password', default=None,
+               help='password for mysql'),
+    cfg.StrOpt('db_host', default=None,
+               help='host of mysql'),
+    cfg.IntOpt('db_port', default=3306,
+               help='port for mysql connection'),
+    cfg.StrOpt('db_connection', default=None,
+               help='driver for connection'),
     cfg.StrOpt('service', default='keystone',
-               help='name service for keystone')
+               help='name service for keystone'),
+    cfg.StrOpt('db_name', default=None,
+               help='database name')
 ]
 
 
@@ -447,20 +622,21 @@ dst_network_opts = [
     cfg.StrOpt('service', default='auto',
                help='name service for network, '
                     'auto - detect available service'),
-    cfg.ListOpt('interfaces_for_instance', default='net04',
-                help='list interfaces for connection to instance'),
-    cfg.StrOpt('host', default='localhost',
+    cfg.StrOpt('db_host', default=None,
                help='Neutron DB node host'),
-    cfg.IntOpt('port', default='3306',
+    cfg.IntOpt('db_port', default=3306,
                help='port for mysql connection'),
-    cfg.StrOpt('password', default='',
+    cfg.StrOpt('db_password', default=None,
                help='Neutron DB password'),
-    cfg.StrOpt('database_name', default='neutron',
+    cfg.StrOpt('db_name', default=None,
                help='Neutron database name'),
-    cfg.StrOpt('connection', default='mysql+mysqlconnector',
+    cfg.StrOpt('db_connection', default=None,
                help='Neutron DB connection type'),
-    cfg.StrOpt('user', default="root",
-               help="DB user for the networking backend")
+    cfg.StrOpt('db_user', default=None,
+               help="DB user for the networking backend"),
+    cfg.StrOpt('get_all_quota', default=False,
+               help="If False, then qoutas will be taken only customs, "
+                    "else All quotas including default and custom")
 ]
 
 dst_objstorage = cfg.OptGroup(name='dst_objstorage',
@@ -468,7 +644,9 @@ dst_objstorage = cfg.OptGroup(name='dst_objstorage',
 
 dst_objstorage_opts = [
     cfg.StrOpt('service', default='swift',
-               help='service name for object storage')
+               help='service name for object storage'),
+    cfg.StrOpt('db_name', default=None,
+               help='database name')
 ]
 
 import_rules = cfg.OptGroup(name='import_rules',
@@ -522,6 +700,37 @@ database_opts = [
     cfg.IntOpt("port", default=6379)]
 
 
+evacuation = cfg.OptGroup(name='evacuation',
+                          title='Evacuation related settings')
+
+evacuation_opts = [
+    cfg.StrOpt('nova_home_path', default='/var/lib/nova',
+               help='Home directory of user under which nova services are '
+                    'running'),
+    cfg.StrOpt('nova_user', default='nova',
+               help='Name of user under which nova services are running'),
+    cfg.IntOpt('state_change_timeout', default=120,
+               help='For how much seconds to wait for VM state change '
+                    'during evacuation'),
+    cfg.IntOpt('migration_timeout', default=600,
+               help='For how much seconds to wait for VM to migrate '
+                    'during evacuation'),
+]
+
+bbcp_group = cfg.OptGroup(name='bbcp', title='BBCP related settings')
+
+bbcp_opts = [
+    cfg.StrOpt('path', default='bbcp',
+               help='path to the executable bbcp to execute on the cloudferry '
+                    'host'),
+    cfg.StrOpt('src_path', default='$path',
+               help='path to the compiled bbcp for the source cloud hosts'),
+    cfg.StrOpt('dst_path', default='$path',
+               help='path to the compiled bbcp for the destination cloud '
+                    'hosts'),
+    cfg.StrOpt('options', default='-P 20', help='additional options'),
+]
+
 cfg_for_reg = [
     (src, src_opts),
     (dst, dst_opts),
@@ -548,7 +757,9 @@ cfg_for_reg = [
     (initial_check, initial_check_opts),
     (condense, condense_opts),
     (database, database_opts),
-    (import_rules, import_rules_opts)
+    (import_rules, import_rules_opts),
+    (evacuation, evacuation_opts),
+    (bbcp_group, bbcp_opts),
 ]
 
 CONF = cfg.CONF
@@ -563,56 +774,3 @@ def init_config(name_config=None):
     if name_config:
         name_configs[0] = name_config
     CONF(default_config_files=name_configs, args="")
-
-
-def get_plugins():
-    plugins = addons
-    dir_plugins = dir(plugins)
-    exclude_field = ['__author__', '__builtins__', '__doc__', '__file__',
-                     '__name__', '__package__', '__path__']
-    plugins = [(item, plugins.__dict__[item])
-               for item in dir_plugins if item not in exclude_field]
-    return plugins
-
-
-def find_group(group):
-    for g in xrange(len(cfg_for_reg)):
-        if group.name == cfg_for_reg[g][0].name:
-            return g
-    return -1
-
-
-def find_field(field, fields):
-    for g in xrange(len(fields)):
-        if field.name == fields[g].name:
-            return g
-    return -1
-
-
-def merge_fields(index_pair, fields):
-    for field in fields:
-        index_field = find_field(field, cfg_for_reg[index_pair][1])
-        if index_field >= 0:
-            cfg_for_reg[index_pair][1][index_field] = field
-        else:
-            cfg_for_reg[index_pair][1].append(field)
-
-
-def merge_cfg(cfg):
-    for pair in cfg:
-        index_pair = find_group(pair[0])
-        if index_pair == -1:
-            cfg_for_reg.append(pair)
-        else:
-            merge_fields(index_pair, pair[1])
-
-
-def collector_configs_plugins():
-    plugins = get_plugins()
-    for plugin in plugins:
-        merge_cfg(plugin[1].cfg_for_reg)
-        name_configs.append('addons/%s/configs/config.ini' % plugin[0])
-
-if __name__ == '__main__':
-    collector_configs_plugins()
-    init_config()

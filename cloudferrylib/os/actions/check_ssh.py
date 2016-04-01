@@ -12,26 +12,37 @@
 # See the License for the specific language governing permissions and#
 # limitations under the License.
 
-
-from fabric.api import settings
+from fabric import api
 
 from cloudferrylib.base.action import action
 from cloudferrylib.utils import remote_runner
-from cloudferrylib.utils import utils as utl
+from cloudferrylib.utils import log
+from cloudferrylib.utils import utils
+
+
+LOG = log.getLogger(__name__)
 
 
 class CheckSSH(action.Action):
     def run(self, info=None, **kwargs):
+
         for node in self.get_compute_nodes():
             self.check_access(node)
 
     def get_compute_nodes(self):
-        return self.cloud.resources[utl.COMPUTE_RESOURCE].get_compute_hosts()
+        return self.cloud.resources[utils.COMPUTE_RESOURCE].get_compute_hosts()
 
     def check_access(self, node):
         cfg = self.cloud.cloud_config.cloud
+        gateway = cfg.ssh_host
         runner = remote_runner.RemoteRunner(node, cfg.ssh_user,
-                                            password=cfg.ssh_sudo_password)
-        with settings(abort_on_prompts=True,
-                      gateway=self.cloud.getIpSsh()):
-            runner.run('echo')
+                                            password=cfg.ssh_sudo_password,
+                                            timeout=60,
+                                            gateway=gateway)
+        try:
+            with api.settings(abort_on_prompts=True):
+                runner.run('echo')
+        except remote_runner.RemoteExecutionError as e:
+            LOG.debug('Check access error: %s', e, exc_info=True)
+            LOG.warning("SSH connection from '%s' to '%s' failed with error: "
+                        "'%s'", gateway, node, e.message)

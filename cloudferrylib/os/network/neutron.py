@@ -11,23 +11,32 @@
 # implied.
 # See the License for the specific language governing permissions and#
 # limitations under the License.
+
+
+import copy
 import pprint
 
 import ipaddr
 import netaddr
+
 from neutronclient.common import exceptions as neutron_exc
 from neutronclient.v2_0 import client as neutron_client
 
+from cloudferrylib.base import exception
 from cloudferrylib.base import network
 from cloudferrylib.os.identity import keystone as ksresource
-from cloudferrylib.utils import mysql_connector
+from cloudferrylib.utils import cache
+from cloudferrylib.utils import log
 from cloudferrylib.utils import utils as utl
 
 
-LOG = utl.get_log(__name__)
+LOG = log.getLogger(__name__)
 DEFAULT_SECGR = 'default'
 
 
+@cache.Cached(getter='get_subnets_list', modifier='create_network')
+@cache.Cached(getter='get_networks_list', modifier='create_network')
+@cache.Cached(getter='get_ports_list', modifier='create_port')
 class NeutronNetwork(network.Network):
 
     """
@@ -41,28 +50,23 @@ class NeutronNetwork(network.Network):
         self.filter_tenant_id = None
         self.ext_net_map = \
             utl.read_yaml_file(self.config.migrate.ext_net_map) or {}
+        self.mysql_connector = cloud.mysql_connector('neutron')
 
     @property
     def neutron_client(self):
         return self.proxy(self.get_client(), self.config)
 
     def get_client(self):
+
         return neutron_client.Client(
             username=self.config.cloud.user,
             password=self.config.cloud.password,
             tenant_name=self.config.cloud.tenant,
-            auth_url=self.config.cloud.auth_url)
-
-    def get_db_connection(self):
-        if not hasattr(self.cloud.config, self.cloud.position + '_network'):
-            LOG.debug('Running on default mysql settings')
-            return mysql_connector.MysqlConnector(self.config.mysql, 'neutron')
-        else:
-            my_settings = getattr(self.cloud.config,
-                                  self.cloud.position + '_network')
-            LOG.debug('Running on custom mysql settings')
-            return mysql_connector.MysqlConnector(my_settings,
-                                                  my_settings.database_name)
+            auth_url=self.config.cloud.auth_url,
+            cacert=self.config.cloud.cacert,
+            insecure=self.config.cloud.insecure,
+            region_name=self.config.cloud.region
+        )
 
     def read_info(self, **kwargs):
 
@@ -77,51 +81,159 @@ class NeutronNetwork(network.Network):
 
         nets = self.get_networks(tenant_id)
         subnets = self.get_subnets(tenant_id)
+        detached_ports = self.get_detached_ports(tenant_id)
+        LOG.debug('List of detached ports: %s',
+                  repr([p['id'] for p in detached_ports]))
 
-        if self.filter_tenant_id:
-            # getting all admin nets
-            admin_tenant_id = self.identity_client.get_tenant_id_by_name(
-                self.config.cloud.tenant)
-            admin_nets = self.get_networks(admin_tenant_id)
-            # getting admin shared nets
-            for net in admin_nets:
-                if net['shared'] or net['router:external']:
-                    LOG.debug("append network ID {}".format(net['id']))
-                    nets.append(net)
-            # getting all admin subnets
-            admin_subnets = self.get_subnets(admin_tenant_id)
-            # getting subnets for shared and tenant nets
-            for subnet in admin_subnets:
-                for net in nets:
-                    if subnet['network_id'] == net['id']:
-                        LOG.debug("append subnet ID {}".format(subnet['id']))
-                        subnets.append(subnet)
+        if self.filter_tenant_id is not None:
+            shared_nets = self.get_shared_networks_raw()
+            for net in shared_nets:
+                # do not include the same network twice
+                if net['id'] in [n['id'] for n in nets]:
+                    continue
+                nets.append(self.convert_networks(net, self.cloud))
+                LOG.debug("Got shared network ID %s", net['id'])
+                # Append subnets from the shared networks
+                for subnet in net['subnets']:
+                    # do not include the same subnets twice
+                    if subnet['id'] in [sn['id'] for sn in subnets]:
+                        continue
+                    subnets.append(self.convert_subnets(subnet, self.cloud))
+                    LOG.debug("Got shared subnet ID %s", subnet['id'])
+
+            full_nets_list = self.get_networks()
+        else:
+            full_nets_list = nets
+
+        # Get full list off busy segmentation IDs
+        used_seg_ids = get_segmentation_ids_from_net_list(full_nets_list)
+
+        routers = self.get_routers()
+        subnet_ids = {sn['id'] for sn in subnets}
+        for router in routers:
+            router['subnet_ids'] = [sn_id for sn_id in router['subnet_ids']
+                                    if sn_id in subnet_ids]
 
         info = {'networks': nets,
                 'subnets': subnets,
-                'routers': self.get_routers(tenant_id),
+                'routers': routers,
+                'detached_ports': detached_ports,
                 'floating_ips': self.get_floatingips(tenant_id),
                 'security_groups': self.get_sec_gr_and_rules(tenant_id),
-                'meta': {}}
+                'quota': self.get_quota(tenant_id),
+                'meta': {
+                    'segmentation_ids': used_seg_ids
+                }}
         if self.config.migrate.keep_lbaas:
             info['lbaas'] = dict()
-            info['lb_pools'] = self.get_lb_pools()
-            info['lb_monitors'] = self.get_lb_monitors()
-            info['lb_members'] = self.get_lb_members()
-            info['lb_vips'] = self.get_lb_vips()
+            info['lb_pools'] = self.get_lb_pools(tenant_id)
+            info['lb_monitors'] = self.get_lb_monitors(tenant_id)
+            info['lb_members'] = self.get_lb_members(tenant_id)
+            info['lb_vips'] = self.get_lb_vips(tenant_id)
         return info
 
+    def show_quota(self, tenant_id=''):
+        return self.neutron_client.show_quota(tenant_id)
+
+    def list_quotas(self):
+        return self.neutron_client.list_quotas()['quotas']
+
+    def get_quota(self, tenant_id):
+        # return structure {'name_tenant': {'subnet': 10, ...}, ...}
+        tenants = {}
+        if not tenant_id:
+            tenants_obj = self.identity_client.get_tenants_list()
+            tenants = {t.id: t.name for t in tenants_obj}
+        else:
+            tenants[tenant_id] = self.identity_client.\
+                try_get_tenant_name_by_id(tenant_id)
+        data = {
+        }
+        if self.config.network.get_all_quota:
+            for t_id, t_val in tenants.iteritems():
+                data[t_val] = self.neutron_client.show_quota(t_id)
+        else:
+            for t in self.neutron_client.list_quotas()['quotas']:
+                if (not tenant_id) or (tenant_id == t['tenant_id']):
+                    tenant_name = self.identity_client.\
+                        try_get_tenant_name_by_id(t['tenant_id'])
+                    data[tenant_name] = {k: v
+                                         for k, v in t.iteritems()
+                                         if k != 'tenant_id'}
+        return data
+
+    def upload_quota(self, quota):
+        identity = self.identity_client
+        for q_name, q_val in quota.iteritems():
+            tenant_id = identity.get_tenant_id_by_name(q_name)
+            self.neutron_client.update_quota(tenant_id, q_val)
+
+    def create_quota(self, tenant_id, quota):
+        return self.neutron_client.update_quota(tenant_id, quota)
+
+    def required_tenants(self, filter_tenant_id=None):
+        old_filter_tanant_id = self.filter_tenant_id
+        self.filter_tenant_id = filter_tenant_id
+
+        tenant_ids = set()
+        for shared_net in self.get_shared_networks_raw():
+            tenant_ids.add(shared_net['tenant_id'])
+        for router in self.get_routers_raw():
+            tenant_ids.add(router['tenant_id'])
+
+        self.filter_tenant_id = old_filter_tanant_id
+
+        return list(tenant_ids)
+
     def deploy(self, info):
+        """
+        Deploy network resources to DST
+
+        Have non trivial behavior when enabled keep_floatingip and
+        change_router_ips. Example:
+        Initial state:
+            src cloud with router external ip 123.0.0.5
+                and FloatingIP 123.0.0.4
+        Migrate resources:
+            1. Move FloatingIP to dst. On dst we have FloatingIP 123.0.0.4
+            2. Create FloatingIP on dst as stub for router IP.
+                On dst we have two FloatingIP [123.0.0.4, 123.0.0.5].
+                IP 123.0.0.5 exists only in OpenStack DB and not crush
+                src network.
+            3. Create router on dst. (here is the main idea) As you see above,
+                ips 123.0.0.4 and 123.0.0.5 already allocated,
+                then OpenStack must allocate another ip for router
+                (e.g. 123.0.0.6).
+            4. FloatingIP 123.0.0.5 is not needed anymore.
+                We use it on 1.3. step for not allow OpenStack create
+                router with this ip. It will be released if you enable
+                clean_router_ips_stub in config
+        After resource migration we have:
+            src router external ip 123.0.0.5 and FloatingIP 123.0.0.4
+            dst router external ip 123.0.0.6 and FloatingIP 123.0.0.4
+        """
         deploy_info = info
-        self.upload_networks(deploy_info['networks'])
-        self.upload_subnets(deploy_info['networks'],
-                            deploy_info['subnets'])
-        self.upload_routers(deploy_info['networks'],
-                            deploy_info['subnets'],
-                            deploy_info['routers'])
+        self.upload_quota(deploy_info['quota'])
+        self.upload_networks(deploy_info['networks'],
+                             deploy_info['meta']['segmentation_ids'],
+                             deploy_info['detached_ports'])
+        dst_router_ip_ids = None
         if self.config.migrate.keep_floatingip:
             self.upload_floatingips(deploy_info['networks'],
                                     deploy_info['floating_ips'])
+            if self.config.migrate.change_router_ips:
+                subnets_map = {subnet['id']: subnet
+                               for subnet in deploy_info['subnets']}
+                router_ips = self.extract_router_ips_as_floating_ips(
+                    subnets_map, deploy_info['routers'])
+                dst_router_ip_ids = self.upload_floatingips(
+                    deploy_info['networks'], router_ips)
+        self.upload_routers(deploy_info['networks'],
+                            deploy_info['subnets'],
+                            deploy_info['routers'])
+        if self.config.migrate.clean_router_ips_stub and dst_router_ip_ids:
+            for router_ip_stub in dst_router_ip_ids:
+                self.neutron_client.delete_floatingip(router_ip_stub)
         self.upload_neutron_security_groups(deploy_info['security_groups'])
         self.upload_sec_group_rules(deploy_info['security_groups'])
         if self.config.migrate.keep_lbaas:
@@ -129,7 +241,7 @@ class NeutronNetwork(network.Network):
                                  deploy_info['subnets'])
             self.upload_lb_monitors(deploy_info['lb_monitors'])
             self.associate_lb_monitors(deploy_info['lb_pools'],
-                                    deploy_info['lb_monitors'])
+                                       deploy_info['lb_monitors'])
             self.upload_lb_members(deploy_info['lb_members'],
                                    deploy_info['lb_pools'])
             self.upload_lb_vips(deploy_info['lb_vips'],
@@ -137,32 +249,67 @@ class NeutronNetwork(network.Network):
                                 deploy_info['subnets'])
         return deploy_info
 
-    def get_func_mac_address(self, instance):
-        return self.get_mac_by_ip
+    def extract_router_ips_as_floating_ips(self, subnets, routers_info):
+        result = []
+        tenant = self.config.migrate.router_ips_stub_tenant
+        for router_info in routers_info:
+            router = Router(router_info, subnets)
+            tenant_name = tenant if tenant else router.tenant_name
+            if router.ext_net_id:
+                result.append({'tenant_name': tenant_name,
+                               'floating_network_id': router.ext_net_id,
+                               'floating_ip_address': router.ext_ip})
+        return result
 
-    def get_mac_by_ip(self, ip_address):
-        for port in self.get_list_ports():
+    def get_mac_by_ip(self, ip_address, instance_id):
+        for port in self.get_ports_list(device_id=instance_id):
             for fixed_ip_info in port['fixed_ips']:
                 if fixed_ip_info['ip_address'] == ip_address:
                     return port["mac_address"]
 
-    def get_list_ports(self, **kwargs):
+    def get_instance_network_info(self, instance_id):
+        ports = []
+        for port in self.get_ports_list(device_id=instance_id):
+            ports.append({
+                'ip_addresses': [x['ip_address'] for x in port['fixed_ips']],
+                'mac_address': port['mac_address'],
+                'floatingip': self.get_port_floating_ip(port['id']),
+                'allowed_address_pairs': port.get('allowed_address_pairs', []),
+            })
+        return ports
+
+    def get_port_floating_ip(self, port_id):
+        floating_ips = self.neutron_client.list_floatingips(
+            port_id=port_id)['floatingips']
+        if floating_ips:
+            LOG.debug('Got %d floating IP for port %s',
+                      len(floating_ips), port_id)
+            return floating_ips[0]['floating_ip_address']
+        else:
+            return None
+
+    def get_ports_list(self, **kwargs):
         return self.neutron_client.list_ports(**kwargs)['ports']
 
-    def create_port(self, net_id, mac, ip, tenant_id, keep_ip, sg_ids=None):
+    def create_port(self, net_id, mac_address, ip_addresses, tenant_id,
+                    keep_ip, sg_ids=None, allowed_address_pairs=None):
         param_create_port = {'network_id': net_id,
-                             'mac_address': mac,
                              'tenant_id': tenant_id}
+        if mac_address:
+            param_create_port['mac_address'] = mac_address
         if sg_ids:
             param_create_port['security_groups'] = sg_ids
         if keep_ip:
-            param_create_port['fixed_ips'] = [{"ip_address": ip}]
+            param_create_port['fixed_ips'] = [{"ip_address": ip}
+                                              for ip in ip_addresses]
+        if allowed_address_pairs is not None:
+            param_create_port['allowed_address_pairs'] = allowed_address_pairs
         with ksresource.AddAdminUserToNonAdminTenant(
                 self.identity_client.keystone_client,
                 self.config.cloud.user,
                 self.config.cloud.tenant):
             LOG.debug("Creating port IP '%s', MAC '%s' on net '%s'",
-                      ip, mac, net_id)
+                      param_create_port.get('fixed_ips'), mac_address, net_id)
             return self.neutron_client.create_port(
                 {'port': param_create_port})['port']
 
@@ -171,28 +318,51 @@ class NeutronNetwork(network.Network):
 
     def get_network(self, network_info, tenant_id, keep_ip=False):
         if keep_ip:
-            instance_addr = ipaddr.IPAddress(network_info['ip'])
-            for snet in self.neutron_client.list_subnets()['subnets']:
-                network = self.get_network({"id": snet['network_id']}, None)
-                if snet['tenant_id'] == tenant_id or network['shared']:
-                    if ipaddr.IPNetwork(snet['cidr']).Contains(instance_addr):
-                        return self.neutron_client.\
-                            list_networks(id=snet['network_id'])['networks'][0]
+            addresses = [ipaddr.IPAddress(ip)
+                         for ip in network_info['ip_addresses']]
+            private = self.neutron_client.list_networks(
+                tenant_id=tenant_id)['networks']
+            shared = self.neutron_client.list_networks(shared=True)['networks']
+            for net in private + shared:
+                subnets = self.neutron_client.list_subnets(
+                    network_id=net['id'])['subnets']
+                if all(any(ipaddr.IPNetwork(subnet['cidr']).Contains(ip)
+                           for subnet in subnets)
+                       for ip in addresses):
+                    return net
         if 'id' in network_info:
-            return self.neutron_client.\
-                list_networks(id=network_info['id'])['networks'][0]
+            networks = self.neutron_client.list_networks(
+                id=network_info['id'])['networks']
+            if len(networks) > 0:
+                return networks[0]
         if 'name' in network_info:
-            return self.neutron_client.\
-                list_networks(name=network_info['name'])['networks'][0]
-        else:
-            raise Exception("Can't find suitable network")
+            networks = self.neutron_client.list_networks(
+                name=network_info['name'])['networks']
+            if len(networks) > 0:
+                return networks[0]
+        LOG.error('Failed to find network %s in tenant %s; keep_ip = %s',
+                  repr(network_info), tenant_id, keep_ip)
+        raise exception.AbortMigrationError("Can't find suitable network")
 
-    def check_existing_port(self, network_id, mac):
-        for port in self.get_list_ports(fields=['network_id',
-                                                'mac_address', 'id']):
-            if (port['network_id'] == network_id) \
-                    and (port['mac_address'] == mac):
-                return port['id']
+    def check_existing_port(self, network_id, mac=None, ip_address=None,
+                            ip_addresses=None, existing_ports=None):
+        if ip_addresses is None:
+            ip_addresses = []
+        if ip_address is not None and ip_address not in ip_addresses:
+            ip_addresses.append(ip_address)
+        if existing_ports is None:
+            existing_ports = self.get_ports_list(
+                fields=['network_id', 'mac_address', 'id', 'fixed_ips',
+                        'device_owner'],
+                network_id=network_id)
+        for port in existing_ports:
+            if port['network_id'] != network_id:
+                continue
+            if port['mac_address'] == mac:
+                return port
+            for fixed_ip in port['fixed_ips']:
+                if fixed_ip['ip_address'] in ip_addresses:
+                    return port
         return None
 
     @staticmethod
@@ -222,16 +392,18 @@ class NeutronNetwork(network.Network):
 
         return obj_map[obj_name](neutron_object, cloud)
 
-    @staticmethod
-    def convert_networks(net, cloud):
+    def convert_networks(self, net, cloud):
         identity_res = cloud.resources[utl.IDENTITY_RESOURCE]
         net_res = cloud.resources[utl.NETWORK_RESOURCE]
         get_tenant_name = identity_res.get_tenants_func()
 
-        subnet_names = []
+        subnets = []
+        subnets_hash = set()
+
         for subnet in net['subnets']:
-            name = net_res.neutron_client.show_subnet(subnet)['subnet']['name']
-            subnet_names.append(name)
+            snet = self.convert_subnets(subnet, cloud)
+            subnets.append(snet)
+            subnets_hash.add(snet['res_hash'])
 
         result = {
             'name': net['name'],
@@ -240,11 +412,12 @@ class NeutronNetwork(network.Network):
             'shared': net['shared'],
             'tenant_id': net['tenant_id'],
             'tenant_name': get_tenant_name(net['tenant_id']),
-            'subnet_names': subnet_names,
+            'subnets': subnets,
             'router:external': net['router:external'],
             'provider:physical_network': net['provider:physical_network'],
             'provider:network_type': net['provider:network_type'],
             'provider:segmentation_id': net['provider:segmentation_id'],
+            'subnets_hash': subnets_hash,
             'meta': {},
         }
 
@@ -252,7 +425,10 @@ class NeutronNetwork(network.Network):
                                              'name',
                                              'shared',
                                              'tenant_name',
-                                             'router:external')
+                                             'router:external',
+                                             'admin_state_up',
+                                             'provider:physical_network',
+                                             'provider:network_type')
         result['res_hash'] = res_hash
         return result
 
@@ -262,7 +438,10 @@ class NeutronNetwork(network.Network):
         network_res = cloud.resources[utl.NETWORK_RESOURCE]
         get_tenant_name = identity_res.get_tenants_func()
 
-        net = network_res.neutron_client.show_network(snet['network_id'])
+        networks_list = network_res.get_networks_list()
+        net = get_network_from_list_by_id(snet['network_id'], networks_list)
+
+        cidr = str(netaddr.IPNetwork(snet['cidr']).cidr)
 
         result = {
             'name': snet['name'],
@@ -271,21 +450,24 @@ class NeutronNetwork(network.Network):
             'allocation_pools': snet['allocation_pools'],
             'gateway_ip': snet['gateway_ip'],
             'ip_version': snet['ip_version'],
-            'cidr': snet['cidr'],
-            'network_name': net['network']['name'],
-            'external': net['network']['router:external'],
+            'cidr': cidr,
+            'network_name': net['name'],
+            'external': net['router:external'],
             'network_id': snet['network_id'],
             'tenant_name': get_tenant_name(snet['tenant_id']),
+            'dns_nameservers': snet['dns_nameservers'],
             'meta': {},
         }
 
         res_hash = network_res.get_resource_hash(result,
                                                  'name',
                                                  'enable_dhcp',
-                                                 'allocation_pools',
+                                                 'ip_version',
                                                  'gateway_ip',
                                                  'cidr',
-                                                 'tenant_name')
+                                                 'allocation_pools',
+                                                 'tenant_name',
+                                                 'network_name')
 
         result['res_hash'] = res_hash
 
@@ -298,33 +480,20 @@ class NeutronNetwork(network.Network):
 
         get_tenant_name = identity_res.get_tenants_func()
 
-        ips = []
-        subnet_ids = []
-
-        LOG.debug("Finding all ports connected to router '%s'", router['name'])
-        for port in net_res.neutron_client.list_ports(device_id=router['id'])['ports']:
-            for ip_info in port['fixed_ips']:
-                LOG.debug("Adding IP '%s' to router '%s'",
-                          ip_info['ip_address'], router['name'])
-                ips.append(ip_info['ip_address'])
-                if ip_info['subnet_id'] not in subnet_ids:
-                    subnet_ids.append(ip_info['subnet_id'])
-
         result = {
             'name': router['name'],
             'id': router['id'],
             'admin_state_up': router['admin_state_up'],
-            'routes': router['routes'],
             'external_gateway_info': router['external_gateway_info'],
             'tenant_name': get_tenant_name(router['tenant_id']),
-            'ips': ips,
-            'subnet_ids': subnet_ids,
             'meta': {},
         }
+        result.update(net_res.get_ports_info(router))
 
         if router['external_gateway_info']:
+            networks_list = net_res.get_networks_list()
             ext_id = router['external_gateway_info']['network_id']
-            ext_net = net_res.neutron_client.show_network(ext_id)['network']
+            ext_net = get_network_from_list_by_id(ext_id, networks_list)
 
             result['ext_net_name'] = ext_net['name']
             result['ext_net_tenant_name'] = get_tenant_name(
@@ -334,7 +503,6 @@ class NeutronNetwork(network.Network):
 
         res_hash = net_res.get_resource_hash(result,
                                              'name',
-                                             'routes',
                                              'tenant_name')
 
         result['res_hash'] = res_hash
@@ -348,8 +516,9 @@ class NeutronNetwork(network.Network):
 
         get_tenant_name = identity_res.get_tenants_func()
 
+        networks_list = net_res.get_networks_list()
         ext_id = floating['floating_network_id']
-        extnet = net_res.neutron_client.show_network(ext_id)['network']
+        extnet = get_network_from_list_by_id(ext_id, networks_list)
 
         result = {
             'id': floating['id'],
@@ -360,6 +529,7 @@ class NeutronNetwork(network.Network):
             'tenant_name': get_tenant_name(floating['tenant_id']),
             'fixed_ip_address': floating['fixed_ip_address'],
             'floating_ip_address': floating['floating_ip_address'],
+            'port_id': floating['port_id'],
             'meta': {},
         }
 
@@ -397,12 +567,8 @@ class NeutronNetwork(network.Network):
         identity_res = cloud.resources[utl.IDENTITY_RESOURCE]
         net_res = cloud.resources[utl.NETWORK_RESOURCE]
 
-        get_tenant_name = identity_res.get_tenants_func()
-
-        security_group_rules = []
-        for rule in sec_gr['security_group_rules']:
-            rule_info = NeutronNetwork.convert(rule, cloud, 'rule')
-            security_group_rules.append(rule_info)
+        get_tenant_name = identity_res.get_tenants_func(
+            return_default_tenant=False)
 
         result = {
             'name': sec_gr['name'],
@@ -410,7 +576,8 @@ class NeutronNetwork(network.Network):
             'tenant_id': sec_gr['tenant_id'],
             'tenant_name': get_tenant_name(sec_gr['tenant_id']),
             'description': sec_gr['description'],
-            'security_group_rules': security_group_rules,
+            'security_group_rules': [NeutronNetwork.convert(gr, cloud, 'rule')
+                                     for gr in sec_gr['security_group_rules']],
             'meta': {},
         }
 
@@ -428,7 +595,8 @@ class NeutronNetwork(network.Network):
         identity_res = cloud.resources[utl.IDENTITY_RESOURCE]
         net_res = cloud.resources[utl.NETWORK_RESOURCE]
 
-        get_tenant_name = identity_res.get_tenants_func()
+        get_tenant_name = identity_res.get_tenants_func(
+            return_default_tenant=False)
 
         result = {
             'name': pool['name'],
@@ -436,8 +604,8 @@ class NeutronNetwork(network.Network):
             'description': pool['description'],
             'lb_method': pool['lb_method'],
             'protocol': pool['protocol'],
-            'provider': pool['provider'],
             'subnet_id': pool['subnet_id'],
+            'provider': pool.get('provider'),
             'tenant_id': pool['tenant_id'],
             'tenant_name': get_tenant_name(pool['tenant_id']),
             'health_monitors': pool['health_monitors'],
@@ -449,9 +617,7 @@ class NeutronNetwork(network.Network):
                                              'name',
                                              'tenant_name',
                                              'lb_method',
-                                             'protocol',
-                                             'provider')
-
+                                             'protocol')
         result['res_hash'] = res_hash
 
         return result
@@ -461,7 +627,8 @@ class NeutronNetwork(network.Network):
         identity_res = cloud.resources[utl.IDENTITY_RESOURCE]
         net_res = cloud.resources[utl.NETWORK_RESOURCE]
 
-        get_tenant_name = identity_res.get_tenants_func()
+        get_tenant_name = identity_res.get_tenants_func(
+            return_default_tenant=False)
 
         result = {
             'id': monitor['id'],
@@ -473,7 +640,7 @@ class NeutronNetwork(network.Network):
             'max_retries': monitor['max_retries'],
             'url_path': monitor.get('url_path', None),
             'expected_codes': monitor.get('expected_codes', None),
-            'pools': monitor['pools'],
+            'pools': monitor.get('pools'),
             'meta': {}
         }
 
@@ -493,7 +660,8 @@ class NeutronNetwork(network.Network):
         identity_res = cloud.resources[utl.IDENTITY_RESOURCE]
         net_res = cloud.resources[utl.NETWORK_RESOURCE]
 
-        get_tenant_name = identity_res.get_tenants_func()
+        get_tenant_name = identity_res.get_tenants_func(
+            return_default_tenant=False)
 
         result = {
             'id': member['id'],
@@ -521,7 +689,8 @@ class NeutronNetwork(network.Network):
         identity_res = cloud.resources[utl.IDENTITY_RESOURCE]
         net_res = cloud.resources[utl.NETWORK_RESOURCE]
 
-        get_tenant_name = identity_res.get_tenants_func()
+        get_tenant_name = identity_res.get_tenants_func(
+            return_default_tenant=False)
 
         result = {
             'name': vip['name'],
@@ -550,14 +719,39 @@ class NeutronNetwork(network.Network):
 
         return result
 
+    def get_shared_networks_raw(self):
+        """Returns list of external and shared networks in raw neutron object
+        format"""
+        external = self.get_networks_raw({'router:external': True})
+        shared = self.get_networks_raw({'shared': True})
+
+        return external + shared
+
+    def get_networks_raw(self, search_dict):
+        """Groups networks with subnets in raw `NeutronClient` format"""
+
+        neutron = self.neutron_client
+        nets = neutron.list_networks(**search_dict)['networks']
+        subnets_list = self.get_subnets_list()
+
+        for net in nets:
+            subnets = []
+            for subnet_id in net['subnets']:
+                subnets.append(get_subnet_from_list_by_id(subnet_id,
+                                                          subnets_list))
+            net['subnets'] = subnets
+
+        return nets
+
     def get_networks(self, tenant_id=''):
         LOG.info("Get networks...")
-        networks = self.get_networks_list(tenant_id)
+        networks = self.get_networks_raw({'tenant_id': tenant_id})
         networks_info = []
 
         for net in networks:
-            cf_net = self.convert(net, self.cloud, 'network')
-            LOG.debug("Adding network: %s", pprint.pformat(cf_net))
+            cf_net = self.convert_networks(net, self.cloud)
+            LOG.debug("Getting info about network '%s' (%s):\n%s",
+                      cf_net['name'], cf_net['id'], pprint.pformat(cf_net))
             networks_info.append(cf_net)
 
         LOG.info("Done.")
@@ -567,10 +761,16 @@ class NeutronNetwork(network.Network):
         return self.neutron_client.list_networks(
             tenant_id=tenant_id)['networks']
 
+    def get_subnets_list(self, tenant_id=''):
+        return self.neutron_client.list_subnets(tenant_id=tenant_id)['subnets']
+
+    def get_detached_ports(self, tenant_id=''):
+        ports = self.neutron_client.list_ports(tenant_id=tenant_id)['ports']
+        return [p for p in ports if not p['device_owner']]
+
     def get_subnets(self, tenant_id=''):
         LOG.info("Get subnets...")
-        subnets = self.neutron_client.list_subnets(
-            tenant_id=tenant_id)['subnets']
+        subnets = self.get_subnets_list(tenant_id)
         subnets_info = []
 
         for snet in subnets:
@@ -581,6 +781,8 @@ class NeutronNetwork(network.Network):
         return subnets_info
 
     def reset_subnet_dhcp(self, subnet_id, dhcp_flag):
+        LOG.debug('Setting enable_dhcp to %s for subnet %s',
+                  dhcp_flag, subnet_id)
         subnet_info = {
             'subnet':
             {
@@ -589,18 +791,38 @@ class NeutronNetwork(network.Network):
         }
         return self.neutron_client.update_subnet(subnet_id, subnet_info)
 
-    def get_routers(self, tenant_id=''):
-        LOG.info("Get routers...")
-        routers = self.neutron_client.list_routers(
-            tenant_id=tenant_id)['routers']
-        routers_info = []
+    def get_ports_info(self, router):
+        LOG.debug("Finding all ports connected to router '%s'", router['name'])
+        ports_list = self.get_ports_list()
+        ports = get_ports_by_device_id_from_list(router['id'], ports_list)
+        subnet_ids = []
+        ips = []
 
-        for router in routers:
-            rinfo = self.convert(router, self.cloud, 'router')
-            routers_info.append(rinfo)
+        for port in ports:
+            for ip_info in port['fixed_ips']:
+                ips.append(ip_info['ip_address'])
+                subnet_ids.append(ip_info['subnet_id'])
 
-        LOG.info("Done")
-        return routers_info
+        return {'ips': set(ips), 'subnet_ids': set(subnet_ids)}
+
+    def get_routers_raw(self):
+        routers = self.neutron_client.list_routers()['routers']
+        if self.filter_tenant_id:
+            subnet_ids = {
+                sn['id']
+                for sn in self.get_subnets_list(self.filter_tenant_id)}
+
+            return [r for r in routers
+                    if (r['tenant_id'] == self.filter_tenant_id or
+                        subnet_ids & self.get_ports_info(r)['subnet_ids'])]
+
+        return routers
+
+    def get_routers(self):
+        LOG.info("Get routers")
+
+        return [self.convert_routers(r, self.cloud)
+                for r in self.get_routers_raw()]
 
     def get_floatingips(self, tenant_id=''):
         LOG.info("Get floatingips...")
@@ -616,14 +838,11 @@ class NeutronNetwork(network.Network):
         return floatingips_info
 
     def get_security_groups(self, tenant_id=''):
-        LOG.info("Get security groups...")
-        sec_grs = self.neutron_client.list_security_groups(
+        return self.neutron_client.list_security_groups(
             tenant_id=tenant_id)['security_groups']
-        LOG.info("Done")
-        return sec_grs
 
     def get_sec_gr_and_rules(self, tenant_id=''):
-        LOG.info("Getting security groups and rules")
+        LOG.info("Getting security groups and rules...")
         service_tenant_name = self.config.cloud.service_tenant
         service_tenant_id = \
             self.identity_client.get_tenant_id_by_name(service_tenant_name)
@@ -632,15 +851,22 @@ class NeutronNetwork(network.Network):
 
         for sec_gr in sec_grs:
             if sec_gr['tenant_id'] != service_tenant_id:
-                sec_gr_info = self.convert(sec_gr, self.cloud, 'security_group')
+                sec_gr_info = self.convert(sec_gr, self.cloud,
+                                           'security_group')
+                if not sec_gr_info['tenant_name']:
+                    # Skip security group from undefined tenant
+                    LOG.warning("Security group '%s' (%s) from tenant %s "
+                                "has been skipped.", sec_gr['name'],
+                                sec_gr['id'], sec_gr['tenant_id'])
+                    continue
                 sec_groups_info.append(sec_gr_info)
 
         LOG.info("Done")
         return sec_groups_info
 
-    def get_lb_pools(self):
+    def get_lb_pools(self, tenant_id=''):
         LOG.info("Getting load balancer pools...")
-        pools = self.neutron_client.list_pools()['pools']
+        pools = self.neutron_client.list_pools(tenant_id=tenant_id)['pools']
         pools_info = []
 
         for pool in pools:
@@ -650,10 +876,11 @@ class NeutronNetwork(network.Network):
         LOG.info("Done")
         return pools_info
 
-    def get_lb_monitors(self):
+    def get_lb_monitors(self, tenant_id=''):
         LOG.info("Getting load balancer monitors...")
         monitors = \
-            self.neutron_client.list_health_monitors()['health_monitors']
+            self.neutron_client.list_health_monitors(
+                tenant_id=tenant_id)['health_monitors']
         monitors_info = []
 
         for mon in monitors:
@@ -663,9 +890,10 @@ class NeutronNetwork(network.Network):
         LOG.info("Done")
         return monitors_info
 
-    def get_lb_members(self):
+    def get_lb_members(self, tenant_id=''):
         LOG.info("Getting load balancer members...")
-        members = self.neutron_client.list_members()['members']
+        members = self.neutron_client.list_members(
+            tenant_id=tenant_id)['members']
         members_info = []
 
         for member in members:
@@ -675,9 +903,10 @@ class NeutronNetwork(network.Network):
         LOG.info("Done")
         return members_info
 
-    def get_lb_vips(self):
+    def get_lb_vips(self, tenant_id=''):
         LOG.info("Getting load balancer VIPs...")
-        vips = self.neutron_client.list_vips()['vips']
+        vips = self.neutron_client.list_vips(
+            tenant_id=tenant_id)['vips']
         vips_info = []
 
         for vip in vips:
@@ -690,13 +919,16 @@ class NeutronNetwork(network.Network):
     def upload_lb_vips(self, vips, pools, subnets):
         LOG.info("Creating load balancer VIPs on destination")
         existing_vips = self.get_lb_vips()
-        existing_vips_hashlist = [ex_vip['res_hash'] for ex_vip in existing_vips]
+        existing_vips_hashlist = [ex_vip['res_hash']
+                                  for ex_vip in existing_vips]
         existing_pools = self.get_lb_pools()
         existing_snets = self.get_subnets()
         for vip in vips:
+            if not vip['tenant_name']:
+                continue
             if vip['res_hash'] not in existing_vips_hashlist:
-                tenant_id = \
-                    self.identity_client.get_tenant_id_by_name(vip['tenant_name'])
+                tenant_id = self.identity_client.get_tenant_id_by_name(
+                    vip['tenant_name'])
                 pool_hash = self.get_res_hash_by_id(pools, vip['pool_id'])
                 dst_pool = self.get_res_by_hash(existing_pools, pool_hash)
                 snet_hash = self.get_res_hash_by_id(subnets, vip['subnet_id'])
@@ -715,13 +947,14 @@ class NeutronNetwork(network.Network):
                     }
                 }
                 if vip['session_persistence']:
-                    vip_info['vip']['session_persistence'] = vip['session_persistence']
-                vip['meta']['id'] = \
-                    self.neutron_client.create_vip(vip_info)['vip']['id']
+                    vip_info['vip']['session_persistence'] = \
+                        vip['session_persistence']
+                vip['meta']['id'] = self.neutron_client.create_vip(
+                    vip_info)['vip']['id']
             else:
                 LOG.info("| Dst cloud already has the same VIP "
-                         "with address %s in tenant %s" %
-                         (vip['address'], vip['tenant_name']))
+                         "with address %s in tenant %s",
+                         vip['address'], vip['tenant_name'])
         LOG.info("Done")
 
     def upload_lb_members(self, members, pools):
@@ -731,22 +964,27 @@ class NeutronNetwork(network.Network):
             [ex_member['res_hash'] for ex_member in existing_members]
         existing_pools = self.get_lb_pools()
         for member in members:
+            if not member['tenant_name']:
+                continue
             if member['res_hash'] not in existing_members_hashlist:
+                tenant_id = self.identity_client.get_tenant_id_by_name(
+                    member['tenant_name'])
                 pool_hash = self.get_res_hash_by_id(pools, member['pool_id'])
                 dst_pool = self.get_res_by_hash(existing_pools, pool_hash)
                 member_info = {
                     'member': {
                         'protocol_port': member["protocol_port"],
                         'address': member['address'],
-                        'pool_id': dst_pool['id']
+                        'pool_id': dst_pool['id'],
+                        'tenant_id': tenant_id
                     }
                 }
-                member['meta']['id'] = \
-                    self.neutron_client.create_member(member_info)['member']['id']
+                member['meta']['id'] = self.neutron_client.create_member(
+                    member_info)['member']['id']
             else:
                 LOG.info("| Dst cloud already has the same member "
-                         "with address %s in tenant %s" %
-                         (member['address'], member['tenant_name']))
+                         "with address %s in tenant %s",
+                         member['address'], member['tenant_name'])
         LOG.info("Done")
 
     def upload_lb_monitors(self, monitors):
@@ -755,9 +993,11 @@ class NeutronNetwork(network.Network):
         existing_mons_hashlist = \
             [ex_mon['res_hash'] for ex_mon in existing_mons]
         for mon in monitors:
+            if not mon['tenant_name']:
+                continue
             if mon['res_hash'] not in existing_mons_hashlist:
-                tenant_id = \
-                    self.identity_client.get_tenant_id_by_name(mon['tenant_name'])
+                tenant_id = self.identity_client.get_tenant_id_by_name(
+                    mon['tenant_name'])
                 mon_info = {
                     'health_monitor':
                         {
@@ -770,13 +1010,14 @@ class NeutronNetwork(network.Network):
                 }
                 if mon['url_path']:
                     mon_info['health_monitor']['url_path'] = mon['url_path']
-                    mon_info['health_monitor']['expected_codes'] = mon['expected_codes']
-                mon['meta']['id'] = \
-                    self.neutron_client.create_health_monitor(mon_info)['health_monitor']['id']
+                    mon_info['health_monitor']['expected_codes'] = \
+                        mon['expected_codes']
+                mon['meta']['id'] = self.neutron_client.create_health_monitor(
+                    mon_info)['health_monitor']['id']
             else:
                 LOG.info("| Dst cloud already has the same healthmonitor "
-                         "with type %s in tenant %s" %
-                         (mon['type'], mon['tenant_name']))
+                         "with type %s in tenant %s",
+                         mon['type'], mon['tenant_name'])
         LOG.info("Done")
 
     def associate_lb_monitors(self, pools, monitors):
@@ -784,19 +1025,22 @@ class NeutronNetwork(network.Network):
         existing_pools = self.get_lb_pools()
         existing_monitors = self.get_lb_monitors()
         for pool in pools:
+            if not pool['tenant_name']:
+                continue
             pool_hash = self.get_res_hash_by_id(pools, pool['id'])
             dst_pool = self.get_res_by_hash(existing_pools, pool_hash)
             for monitor_id in pool['health_monitors']:
                 monitor_hash = self.get_res_hash_by_id(monitors, monitor_id)
-                dst_monitor = self.get_res_by_hash(existing_monitors, monitor_hash)
+                dst_monitor = self.get_res_by_hash(existing_monitors,
+                                                   monitor_hash)
                 if dst_monitor['id'] not in dst_pool['health_monitors']:
                     dst_monitor_info = {
-                        'health_monitor':{
+                        'health_monitor': {
                             'id': dst_monitor['id']
                         }
                     }
-                    self.neutron_client.associate_health_monitor(dst_pool['id'],
-                                                                 dst_monitor_info)
+                    self.neutron_client.associate_health_monitor(
+                        dst_pool['id'], dst_monitor_info)
                 else:
                     LOG.info(
                         "Dst pool with name %s already has associated the "
@@ -812,31 +1056,32 @@ class NeutronNetwork(network.Network):
             [ex_pool['res_hash'] for ex_pool in existing_pools]
         existing_subnets = self.get_subnets()
         for pool in pools:
-            if pool['res_hash'] not in existing_pools_hashlist:
-                tenant_id = \
-                    self.identity_client.get_tenant_id_by_name(pool['tenant_name'])
+            if pool['res_hash'] not in existing_pools_hashlist and \
+                    pool['tenant_name']:
+                tenant_id = self.identity_client.get_tenant_id_by_name(
+                    pool['tenant_name'])
                 snet_hash = self.get_res_hash_by_id(subnets, pool['subnet_id'])
                 snet_id = self.get_res_by_hash(existing_subnets,
                                                snet_hash)['id']
                 pool_info = {
-                    'pool':
-                        {
-                            'name': pool['name'],
-                            'description': pool['description'],
-                            'tenant_id': tenant_id,
-                            'provider': pool['provider'],
-                            'subnet_id': snet_id,
-                            'protocol': pool['protocol'],
-                            'lb_method': pool['lb_method']
-                            }
+                    'pool': {
+                        'name': pool['name'],
+                        'description': pool['description'],
+                        'tenant_id': tenant_id,
+                        'subnet_id': snet_id,
+                        'protocol': pool['protocol'],
+                        'lb_method': pool['lb_method']
+                    }
                 }
+                if pool.get('provider'):
+                    pool_info['pool']['provider'] = pool.get('provider')
                 LOG.debug("Creating LB pool '%s'", pool['name'])
                 pool['meta']['id'] = \
                     self.neutron_client.create_pool(pool_info)['pool']['id']
             else:
                 LOG.info("| Dst cloud already has the same pool "
-                         "with name %s in tenant %s" %
-                         (pool['name'], pool['tenant_name']))
+                         "with name %s in tenant %s",
+                         pool['name'], pool['tenant_name'])
         LOG.info("Done")
 
     def upload_neutron_security_groups(self, sec_groups):
@@ -902,239 +1147,265 @@ class NeutronNetwork(network.Network):
                     rule['meta']['id'] = new_rule['security_group_rule']['id']
         LOG.info("Done")
 
-    def upload_networks(self, networks):
+    def upload_networks(self, networks, src_seg_ids, detached_ports):
         LOG.info("Creating networks on destination")
+        identity = self.identity_client
 
         existing_networks = self.get_networks()
-        existing_nets_hashlist = (
-            [ex_net['res_hash'] for ex_net in existing_networks])
 
         # we need to handle duplicates in segmentation ids
-        # hash is used with structure {"gre": [1, 2, ...],
-        #                              "vlan": [1, 2, ...]}
-        # networks with "provider:physical_network" property added
-        # because only this networks seg_ids will be copied
-        used_seg_ids = {}
-        for net in existing_networks:
-            if net.get("provider:physical_network"):
-                net_type = net.get("provider:network_type")
-                if net_type not in used_seg_ids:
-                    used_seg_ids[net_type] = []
-                used_seg_ids[net_type].append(
-                    net.get("provider:segmentation_id"))
+        dst_seg_ids = get_segmentation_ids_from_net_list(existing_networks)
 
-        networks_without_seg_ids = {}
-        identity = self.identity_client
-        for net in networks:
-            LOG.debug("Trying to create network '%s'", net['name'])
-            tenant_id = identity.get_tenant_id_by_name(net['tenant_name'])
+        for src_net in networks:
+            network_detached_ports = [p for p in detached_ports
+                                      if p['network_id'] == src_net['id']]
+
+            # Check network for existence on destination cloud
+            dst_net = self.get_dst_net_by_src_net(existing_networks, src_net)
+            if dst_net:
+                LOG.info("DST cloud already has the same "
+                         "network with name '%s' in tenant '%s'",
+                         src_net['name'], src_net['tenant_name'])
+                self.deploy_detached_ports(dst_net, network_detached_ports)
+                continue
+
+            LOG.debug("Trying to create network '%s'", src_net['name'])
+            tenant_id = identity.get_tenant_id_by_name(src_net['tenant_name'])
 
             if tenant_id is None:
                 LOG.warning("Tenant '%s' is not available on destination! "
                             "Make sure you migrated identity (keystone) "
                             "resources! Skipping network '%s'.",
-                            net['tenant_name'], net['name'])
+                            src_net['tenant_name'], src_net['name'])
+                continue
+
+            no_extnet_migration = (
+                src_net.get('router:external') and
+                not self.config.migrate.migrate_extnets or
+                (src_net['id'] in self.ext_net_map))
+            if no_extnet_migration:
+                LOG.debug("External networks migration is disabled in the "
+                          "config OR external networks mapping is enabled. "
+                          "Skipping external network: '%s (%s)'",
+                          src_net['name'], src_net['id'])
                 continue
 
             # create dict, representing basic info about network
             network_info = {
                 'network': {
                     'tenant_id': tenant_id,
-                    'admin_state_up': net["admin_state_up"],
-                    'shared': net["shared"],
-                    'name': net['name'],
-                    'router:external': net['router:external']
+                    'admin_state_up': src_net["admin_state_up"],
+                    'shared': src_net["shared"],
+                    'name': src_net['name'],
+                    'router:external': src_net['router:external']
                 }
             }
-            if net.get('router:external'):
-                if not self.config.migrate.migrate_extnets or \
-                        (net['id'] in self.ext_net_map):
-                    LOG.debug("skipping external network '%s (%s)'",
-                              net['name'], net['id'])
-                    continue
-            # create network on destination cloud
-            if net['res_hash'] not in existing_nets_hashlist:
-                if net.get("provider:physical_network"):
-                    # update info with additional arguments
-                    # we need to check if we have parameter
-                    # "provider:physical_network"
-                    # if we do - we need to specify 2 more
-                    # "provider:network_type" and "provider:segmentation_id"
-                    # if we don't have this parameter - creation will be
-                    # handled automatically (this automatic handling goes
-                    # after creation of networks with provider:physical_network
-                    # attribute to avoid seg_id overlap)
-                    for atr in ["provider:physical_network",
-                                "provider:network_type"]:
-                        network_info['network'].update({atr: net.get(atr)})
 
-                    # check if we have seg_ids of that type
-                    if (used_seg_ids.get(net["provider:network_type"]) and
-                        net['provider:segmentation_id'] in used_seg_ids[
-                            net["provider:network_type"]]):
-                        LOG.warning(
-                            "network {network} was dropped according"
-                            " because its segmentation id already "
-                            " exists on destination cloud".format(
-                                network=net.get("id")))
-                        continue
+            phys_net = src_net["provider:physical_network"]
+            network_type = src_net['provider:network_type']
+            seg_id = src_net["provider:segmentation_id"]
+
+            if phys_net or (src_net['provider:network_type'] in
+                            ['gre', 'vxlan']):
+                # Update network info with additional arguments.
+                # We need to check if we have parameter
+                # "provider:physical_network" or param
+                # "provider:network_type" either is 'gre' or 'vxlan'.
+                # If condition is satisfied, we need to specify 2 more params:
+                # "provider:network_type" and "provider:segmentation_id".
+                list_update_atr = ["provider:network_type"]
+                if phys_net:
+                    list_update_atr.append("provider:physical_network")
+                for atr in list_update_atr:
+                    network_info['network'].update({atr: src_net.get(atr)})
+
+                # Check segmentation ID for overlapping
+                # If it doesn't overlap with DST, save the same segmentation ID
+                # Otherwise pick free segmentation ID, which does not overlap
+                # with ANY segmentation ID on SRC
+                if seg_id is not None:
+                    # Segmentation ID exists; Check for overlapping
+                    seg_id_overlaps = (network_type in dst_seg_ids and
+                                       seg_id in dst_seg_ids[network_type])
+
+                    if seg_id_overlaps:
+                        # Choose the lowest free segmentation ID, that also
+                        # does not overlap with SRC
+                        new_seg_id = generate_new_segmentation_id(src_seg_ids,
+                                                                  dst_seg_ids,
+                                                                  network_type)
+
+                        LOG.debug("'%s' segmentation ID '%s' overlaps with "
+                                  "DST. Generating new one: '%s'.",
+                                  network_type, seg_id, new_seg_id)
+
+                        # Use it for network
+                        network_info['network']['provider:segmentation_id'] = (
+                            new_seg_id)
+
+                        # Update DST segmentation IDs with the just created one
+                        dst_seg_ids[network_type].append(new_seg_id)
+
                     else:
-                        if net["provider:segmentation_id"]:
-                            network_info['network'][
-                                'provider:segmentation_id'] = net[
-                                    'provider:segmentation_id']
-                        else:
-                            networks_without_seg_ids.update({
-                                net.get("id"): network_info
-                            })
-                            continue
-                    net['meta']['id'] = (
-                        self.neutron_client.create_network(
-                            network_info)['network']['id'])
-                else:
-                    # create networks later (to be sure that generated
-                    # segmentation ids don't overlap segmentation ids
-                    # created manually)
-                    networks_without_seg_ids.update({
-                        net.get("id"): network_info
-                    })
-            else:
-                LOG.info("| Dst cloud already has the same network "
-                         "with name %s in tenant %s" %
-                         (net['name'], net['tenant_name']))
+                        # Otherwise use original segmentation ID from SRC
+                        network_info['network']['provider:segmentation_id'] = (
+                            seg_id)
 
-        for net in networks:
-            # we need second cycle to update external object "networks"
-            # with metadata
-            if net.get("id") in networks_without_seg_ids:
-                network_info = networks_without_seg_ids[net.get("id")]
-                LOG.debug("Creating network '%s', network params: %s",
-                          net['name'], pprint.pformat(network_info))
-                try:
-                    net['meta']['id'] = (
-                        self.neutron_client.create_network(
-                            network_info)['network']['id'])
-                except neutron_exc.NeutronClientException as e:
-                    LOG.error("Cannot create network on destination: %s", e)
+            created_network = self.create_network(src_net, network_info)
+            self.deploy_detached_ports(created_network, network_detached_ports)
 
-    def upload_subnets(self, networks, subnets):
-        LOG.info("Creating subnets on destination")
-        existing_nets = self.get_networks()
-        existing_subnets_hashlist = \
-            [ex_snet['res_hash'] for ex_snet in self.get_subnets()]
-        for snet in subnets:
-            if snet['external']:
-                if not self.config.migrate.migrate_extnets or \
-                                snet['network_id'] in self.ext_net_map:
-                    LOG.debug("Skipping external subnet '%s (%s)'",
-                              snet.get('name'), snet['id'])
+    def deploy_detached_ports(self, net, ports):
+        for subnet in net['subnets']:
+            self.reset_subnet_dhcp(subnet['id'], False)
+        existing_ports = {p['id']: p
+                          for p in self.get_ports_list(network_id=net['id'])}
+        for port in ports:
+            ip_addresses = [fip['ip_address'] for fip in port['fixed_ips']]
+            existing_port = self.check_existing_port(
+                net['id'], port['mac_address'],
+                ip_addresses=ip_addresses,
+                existing_ports=existing_ports.values())
+            if existing_port is not None:
+                if existing_port['mac_address'] == port['mac_address']:
+                    LOG.debug('Port %s already migrated to %s',
+                              port['id'], existing_port['id'])
                     continue
-            tenant_id = \
-                self.identity_client.get_tenant_id_by_name(snet['tenant_name'])
-            if not tenant_id:
-                LOG.debug("Cannot get tenant_id for subnet {subnet}".format(
-                    subnet=snet.get("id")))
-                continue
-            net_hash = \
-                self.get_res_hash_by_id(networks, snet['network_id'])
-            if not net_hash:
-                LOG.debug("Cannot get network info for subnet {subnet}".format(
-                    subnet=snet.get("id")))
-                continue
-            network = \
-                self.get_res_by_hash(existing_nets, net_hash)
-            if not network:
-                LOG.debug("Cannot get network for subnet {subnet}".format(
-                    subnet=snet.get("id")))
-                continue
 
+                if existing_port['device_owner'].startswith('network:') or \
+                        not existing_port['device_owner']:
+                    LOG.debug('Deleting port %s from DST', repr(existing_port))
+                    self.delete_port(existing_port['id'])
+                    del existing_ports[existing_port['id']]
+                else:
+                    raise exception.AbortMigrationError(
+                        'Can\'t migrate port %s conflict with port %s' %
+                        (port['id'], existing_port['id']))
+
+            self.create_port(net['id'], port['mac_address'], ip_addresses,
+                             net['tenant_id'], True)
+        for subnet in net['subnets']:
+            if subnet['enable_dhcp']:
+                self.reset_subnet_dhcp(subnet['id'], True)
+
+    def create_network(self, src_net, network_info):
+        try:
+            LOG.debug("creating network with args: '%s'",
+                      pprint.pformat(network_info))
+            created_net = self.neutron_client.create_network(network_info)
+            created_net = created_net['network']
+            LOG.info("Created net '%s'", created_net['name'])
+        except neutron_exc.NeutronClientException as e:
+            LOG.warning("Cannot create network on destination: %s. "
+                        "Destination cloud already has the same network. May "
+                        "result in port allocation errors, such as VM IP "
+                        "allocation, floating IP allocation, router IP "
+                        "allocation, etc.", e)
+            return
+
+        for snet in src_net['subnets']:
             subnet_info = {
-                'subnet':
-                {
+                'subnet': {
                     'name': snet['name'],
                     'enable_dhcp': snet['enable_dhcp'],
-                    'network_id': network['id'],
+                    'network_id': created_net['id'],
                     'cidr': snet['cidr'],
                     'allocation_pools': snet['allocation_pools'],
                     'gateway_ip': snet['gateway_ip'],
                     'ip_version': snet['ip_version'],
-                    'tenant_id': tenant_id
+                    'dns_nameservers': snet['dns_nameservers'],
+                    'tenant_id': created_net['tenant_id']
                 }
             }
-            if snet['res_hash'] not in existing_subnets_hashlist:
-                LOG.debug("Creating subnet '%s (%s)'", snet['cidr'], snet['id'])
-                snet['meta']['id'] = self.neutron_client.\
-                    create_subnet(subnet_info)['subnet']['id']
-            else:
-                LOG.info("| Dst cloud already has the same subnetwork "
-                         "with name %s in tenant %s" %
-                         (snet['name'], snet['tenant_name']))
+            try:
+                created_subnet = self.neutron_client.create_subnet(subnet_info)
+                created_subnet = created_subnet['subnet']
+                snet['meta']['id'] = created_subnet['id']
+
+                LOG.info("Created subnet '%s' in net '%s'",
+                         created_subnet['cidr'], created_net['name'])
+                created_net['subnets'].append(created_subnet)
+            except neutron_exc.NeutronClientException:
+                LOG.info("Subnet '%s' (%s) already exists, skipping",
+                         snet['name'], snet['cidr'])
+
+        return created_net
 
     def upload_routers(self, networks, subnets, routers):
         LOG.info("Creating routers on destination")
-        existing_nets = self.get_networks()
         existing_subnets = self.get_subnets()
         existing_routers = self.get_routers()
-        existing_routers_hashlist = \
-            [ex_router['res_hash'] for ex_router in existing_routers]
         for router in routers:
-            tname = router['tenant_name']
-            tenant_id = \
-                self.identity_client.get_tenant_id_by_name(tname)
+            tenant_id = self.identity_client.get_tenant_id_by_name(
+                router['tenant_name'])
             r_info = {'router': {'name': router['name'],
                                  'tenant_id': tenant_id}}
-            if router['external_gateway_info']:
-                ex_net_id = self.get_new_extnet_id(router['ext_net_id'],
-                                                   networks, existing_nets)
-                if not ex_net_id:
-                    LOG.debug("Skipping router '%s': no net ID",
-                              router['name'])
-                    continue
-                r_info['router']['external_gateway_info'] = \
-                    dict(network_id=ex_net_id)
-            if router['res_hash'] not in existing_routers_hashlist:
+            existing_router = self.get_res_by_hash(existing_routers,
+                                                   router['res_hash'])
+            if not existing_router:
                 LOG.debug("Creating router %s", pprint.pformat(r_info))
-                new_router = \
-                    self.neutron_client.create_router(r_info)['router']
-                router['meta']['id'] = new_router['id']
-                self.add_router_interfaces(router,
-                                           new_router,
-                                           subnets,
-                                           existing_subnets)
-            else:
-                existing_router = self.get_res_by_hash(existing_routers,
-                                                       router['res_hash'])
-                if not set(router['ips']).intersection(existing_router['ips']):
-                    LOG.debug("Creating router %s", pprint.pformat(r_info))
-                    new_router = \
-                        self.neutron_client.create_router(r_info)['router']
-                    router['meta']['id'] = new_router['id']
-                    self.add_router_interfaces(router,
-                                               new_router,
-                                               subnets,
-                                               existing_subnets)
-                else:
-                    LOG.info("| Dst cloud already has the same router "
-                             "with name %s in tenant %s" %
-                             (router['name'], router['tenant_name']))
+                existing_router = self.convert_routers(
+                    self.neutron_client.create_router(r_info)['router'],
+                    self.cloud)
+            router['meta']['id'] = existing_router['id']
+            self.add_router_interfaces(router, existing_router, subnets,
+                                       existing_subnets)
 
-    def add_router_interfaces(self, src_router, dst_router,
-                              src_snets, dst_snets):
-        LOG.info("Adding router interfaces")
-        for snet_id in src_router['subnet_ids']:
-            snet_hash = self.get_res_hash_by_id(src_snets, snet_id)
-            src_net = self.get_res_by_hash(src_snets, snet_hash)
-            ex_snet = self.get_res_by_hash(dst_snets, snet_hash)
-            if src_net['external']:
+            ex_gw_info = router['external_gateway_info']
+            if ex_gw_info:
+                self.add_router_gateway(existing_router, router['ext_net_id'],
+                                        networks,
+                                        ex_gw_info.get('enable_snat'))
+
+    def add_router_gateway(self, dst_router, ext_net_id, src_nets,
+                           set_snat=None):
+        """
+        :param set_snat: possible values:
+         1. `None` - do not update, useful in cases when destination cloud does
+            not support SNAT for external networks (pre-icehouse);
+         2. `True` - enable SNAT
+         3. `False` - disable SNAT
+        """
+
+        dst_nets = self.get_networks()
+        dst_net_id = self.get_new_extnet_id(ext_net_id, src_nets, dst_nets)
+        if dst_net_id:
+            info = {'network_id': dst_net_id}
+            if set_snat is not None:
+                info['enable_snat'] = set_snat
+            LOG.debug("Setting the external network (%s) gateway for a router "
+                      "'%s' (%s)", dst_net_id, dst_router['name'],
+                      dst_router['id'])
+            self.neutron_client.add_gateway_router(dst_router['id'], info)
+        else:
+            LOG.warning('External (%s) network is not exists on destination',
+                        ext_net_id)
+
+    def add_router_interfaces(self, src_router, dst_router, src_subnets,
+                              dst_subnets):
+        for subnet_id in src_router['subnet_ids']:
+            subnet_hash = self.get_res_hash_by_id(src_subnets, subnet_id)
+
+            src_subnet = self.get_res_by_hash(src_subnets, subnet_hash)
+            if src_subnet['external']:
                 LOG.debug("NOT connecting subnet '%s' to router '%s' because "
-                          "it's connected to external network", snet_id,
+                          "it's connected to external network", subnet_id,
                           dst_router['name'])
                 continue
-            LOG.debug("Adding subnet '%s' to router '%s'", snet_id,
+
+            existing_subnet = self.get_res_by_hash(dst_subnets, subnet_hash)
+            if existing_subnet['id'] in dst_router['subnet_ids']:
+                continue
+
+            LOG.debug("Adding subnet '%s' to router '%s'", subnet_id,
                       dst_router['name'])
-            self.neutron_client.add_interface_router(
-                dst_router['id'],
-                {"subnet_id": ex_snet['id']})
+            try:
+                self.neutron_client.add_interface_router(
+                    dst_router['id'],
+                    {"subnet_id": existing_subnet['id']})
+            except neutron_exc.NeutronClientException as e:
+                LOG.debug(e, exc_info=True)
+                LOG.warning("Couldn't add interface to subnet %s to router %s:"
+                            "\n%s", existing_subnet['id'], dst_router['id'], e)
 
     def upload_floatingips(self, networks, src_floats):
         """Creates floating IPs on destination
@@ -1147,11 +1418,19 @@ class NeutronNetwork(network.Network):
          2.1. Modify IP address of a floating IP to be the same as on
               destination. This is done from the DB level.
          2.2. Else - do not modify floating IP address
+         3. Return list of ID of new floating IPs
         """
         LOG.info("Uploading floating IPs...")
         existing_networks = self.get_networks()
+        new_floating_ids = []
+        fips_dst = self.neutron_client.list_floatingips()['floatingips']
+        ipfloatings = {fip['floating_ip_address']: fip['id']
+                       for fip in fips_dst}
         for fip in src_floats:
-            # keystone auth fails if done with token for some reason
+            ip = fip['floating_ip_address']
+            if ip in ipfloatings:
+                new_floating_ids.append(ipfloatings[ip])
+                continue
             with ksresource.AddAdminUserToNonAdminTenant(
                     self.identity_client.keystone_client,
                     self.config.cloud.user,
@@ -1169,31 +1448,55 @@ class NeutronNetwork(network.Network):
                 tenant = self.identity_client.keystone_client.tenants.find(
                     name=fip['tenant_name'])
 
-                if self.filter_tenant_id and \
-                        (self.filter_tenant_id != tenant.id):
-                    LOG.info("Skipping floating IP '%s' based on filter rules",
-                             fip['floating_ip_address'])
-                    continue
-
                 new_fip = {
                     'floatingip': {
                         'floating_network_id': ext_net_id,
                         'tenant_id': tenant.id
                     }
                 }
-                LOG.debug("Creating FIP on net '%s'", ext_net_id)
-                created_fip = self.neutron_client.create_floatingip(new_fip)
+                created_fip = self.create_floatingip(new_fip)
+                if created_fip is None:
+                    continue
 
-            dst_mysql = self.get_db_connection()
-            sql = ('UPDATE floatingips '
-                   'SET floating_ip_address="{ip}" '
-                   'WHERE id="{fip_id}"').format(
-                ip=fip['floating_ip_address'],
-                fip_id=created_fip['floatingip']['id'])
-            LOG.debug(sql)
-            dst_mysql.execute(sql)
+            fip_id = created_fip['id']
+            new_floating_ids.append(fip_id)
+            sqls = [('UPDATE IGNORE floatingips '
+                     'SET floating_ip_address = "{ip}" '
+                     'WHERE id = "{fip_id}"').format(ip=ip, fip_id=fip_id),
+                    ('UPDATE IGNORE ipallocations '
+                     'SET ip_address = "{ip}" '
+                     'WHERE port_id = ('
+                         'SELECT floating_port_id '
+                         'FROM floatingips '
+                         'WHERE id = "{fip_id}")').format(
+                        ip=ip, fip_id=fip_id),
+                    ('DELETE FROM ipavailabilityranges '
+                     'WHERE allocation_pool_id in ( '
+                         'SELECT id '
+                         'FROM ipallocationpools '
+                         'WHERE subnet_id = ( '
+                             'SELECT subnet_id '
+                             'FROM ipallocations '
+                             'WHERE port_id = ( '
+                             'SELECT floating_port_id '
+                             'FROM floatingips '
+                             'WHERE id = "{fip_id}")))').format(
+                        fip_id=fip_id)]
+            LOG.debug(sqls)
+            dst_mysql = self.mysql_connector
+            dst_mysql.batch_execute(sqls)
 
         LOG.info("Done")
+        return new_floating_ids
+
+    def create_floatingip(self, fip):
+        try:
+            LOG.debug("Creating FIP on net '%s'",
+                      fip['floatingip']['floating_network_id'])
+            created = self.neutron_client.create_floatingip(fip)
+            return created['floatingip']
+        except neutron_exc.NeutronClientException as e:
+            LOG.warning("Unable to create floating IP on destination: '%s'", e)
 
     def update_floatingip(self, floatingip_id, port_id=None):
         update_dict = {'floatingip': {'port_id': port_id}}
@@ -1216,27 +1519,237 @@ class NeutronNetwork(network.Network):
 
     @staticmethod
     def get_resource_hash(neutron_resource, *args):
+        net_res = copy.deepcopy(neutron_resource)
         list_info = list()
         for arg in args:
-            if type(neutron_resource[arg]) is not list:
-                if arg == 'cidr':
-                    cidr = str(netaddr.IPNetwork(neutron_resource[arg]).cidr)
-                    neutron_resource[arg] = cidr
-                list_info.append(neutron_resource[arg])
+            if not isinstance(net_res[arg], list):
+                list_info.append(net_res[arg])
             else:
-                for argitem in arg:
-                    if type(argitem) is str:
+                if arg == 'allocation_pools':
+                    pools = net_res[arg]
+                    net_res[arg] = [ip for pl in pools for ip in pl.values()]
+                for argitem in net_res[arg]:
+                    if isinstance(argitem, basestring):
                         argitem = argitem.lower()
                     list_info.append(argitem)
         hash_list = \
-            [info.lower() if type(info) is str else info for info in list_info]
+            [info.lower() if isinstance(info, basestring) else info
+             for info in list_info]
         hash_list.sort()
         return hash(tuple(hash_list))
 
     def get_new_extnet_id(self, src_net_id, src_nets, dst_nets):
+        """
+        Get ID of similar external network form DST.
+
+        :param src_net_id: External network ID from SRC cloud,
+        :param src_nets: Networks list from SRC cloud,
+        :param dst_nets: Networks list from DST cloud,
+
+        :return unicode: External network ID from DST, that matches with the
+                         similar network from SRC.
+        """
+
         if src_net_id in self.ext_net_map:
             dst_net_id = self.ext_net_map[src_net_id]
         else:
-            net_hash = self.get_res_hash_by_id(src_nets, src_net_id)
-            dst_net_id = self.get_res_by_hash(dst_nets, net_hash)['id']
+            src_net = get_network_from_list_by_id(src_net_id, src_nets)
+            dst_net = self.get_dst_net_by_src_net(dst_nets, src_net)
+
+            if not dst_net:
+                return
+
+            dst_net_id = dst_net['id']
+
         return dst_net_id
+
+    @staticmethod
+    def get_dst_net_by_src_net(existing_networks, src_net):
+        """
+        Get the same Network object from DST cloud.
+
+        :param existing_networks: Existing networks list on DST cloud,
+        :param src_net: Network object from SRC,
+
+        :return dict: Network object from DST, that matches with the same
+                      network from SRC.
+        """
+
+        for net in existing_networks:
+            if (net['res_hash'] == src_net['res_hash'] and
+                    net['subnets_hash'] == src_net['subnets_hash']):
+                return net
+
+
+class Router(object):
+    """
+    Represents router_info, extract external ip.
+    Router_info contain list of ips only in different order. Impossible to
+    define external router ip.
+    """
+    def __init__(self, router_info, subnets):
+        self.id = router_info['id']
+        self.ext_net_id = router_info.get('ext_net_id', None)
+        self.int_cidr = []
+        self.tenant_name = router_info['tenant_name']
+        if self.ext_net_id:
+            subnet_ids = router_info['subnet_ids']
+            for subnet_id in subnet_ids:
+                subnet = subnets[subnet_id]
+                if subnet['network_id'] == self.ext_net_id:
+                    self.ext_cidr = subnet['cidr']
+                    self.ext_subnet_id = subnet_id
+                else:
+                    self.int_cidr.append(subnet['cidr'])
+            ext_network = ipaddr.IPNetwork(self.ext_cidr)
+            for ip in router_info['ips']:
+                if ext_network.Contains(ipaddr.IPAddress(ip)):
+                    self.ext_ip = ip
+                    break
+
+
+def get_network_from_list_by_id(network_id, networks_list):
+    """Get Neutron network by id from provided networks list.
+
+    :param network_id: Neutron network ID
+    :param networks_list: List of Neutron networks, where target network should
+                          be searched
+    """
+
+    for net in networks_list:
+        if net['id'] == network_id:
+            return net
+
+    LOG.warning("Cannot obtain network with id='%s' from provided networks "
+                "list", network_id)
+
+
+def get_subnet_from_list_by_id(subnet_id, subnets_list):
+    """Get Neutron subnet by id from provided subnets list.
+
+    :param subnet_id: Neutron subnet ID
+    :param subnets_list: List of Neutron subnets, where target subnet should
+                         be searched
+    """
+
+    for subnet in subnets_list:
+        if subnet['id'] == subnet_id:
+            return subnet
+
+    LOG.warning("Cannot obtain subnet with id='%s' from provided subnets "
+                "list", subnet_id)
+
+
+def get_ports_by_device_id_from_list(device_id, ports_list):
+    """Get Neutron ports by device ID from provided ports list.
+
+    :param device_id: Port device ID
+    :param ports_list: List of Neutron ports, where target ports should be
+                       searched
+
+    :result: List of ports, which are belong to specified device ID
+    """
+
+    ports = []
+
+    for port in ports_list:
+        if port['device_id'] == device_id:
+            ports.append(port)
+
+    if not ports:
+        LOG.debug("There are no ports with device_id='%s' in provided list",
+                  device_id)
+
+    return ports
+
+
+def get_network_from_list(ip, tenant_id, networks_list, subnets_list):
+    """Get Neutron network by parameters from provided list.
+
+    :param ip: IP address of VM from this network
+    :param tenant_id: Tenant Id of VM in this network
+    :param networks_list: List of Neutron networks, where target network
+                          should be searched
+    :param subnets_list: List of Neutron subnets, where target network
+                         should be searched
+    """
+
+    instance_ip = ipaddr.IPAddress(ip)
+
+    for subnet in subnets_list:
+        network_id = subnet['network_id']
+        net = get_network_from_list_by_id(network_id, networks_list)
+        if subnet['tenant_id'] == tenant_id or net['shared']:
+            if ipaddr.IPNetwork(subnet['cidr']).Contains(instance_ip):
+                return get_network_from_list_by_id(network_id,
+                                                   networks_list)
+
+
+def get_segmentation_ids_from_net_list(networks):
+    """Get busy segmentation IDs from provided networks list.
+
+    We need to handle duplicates in segmentation ids.
+    Neutron has different validation rules for different network types.
+
+    For 'gre' and 'vxlan' network types there is no strong requirement
+    for 'physical_network' attribute, if we want to have
+    'segmentation_id', because traffic is encapsulated in L3 packets.
+
+    For 'vlan' network type there is a strong requirement for
+    'physical_network' attribute, if we want to have 'segmentation_id'.
+
+    :result: Dictionary with busy segmentation IDs.
+             Hash is used with structure {"gre": [1, 2, ...],
+                                          "vlan": [1, 2, ...]}
+    """
+
+    used_seg_ids = {}
+
+    for net in networks:
+        network_has_segmentation_id = (
+            net["provider:physical_network"] or
+            (net["provider:network_type"] in ['gre', 'vxlan']))
+
+        if network_has_segmentation_id:
+            if net["provider:network_type"] not in used_seg_ids:
+                used_seg_ids[net['provider:network_type']] = []
+            if net["provider:segmentation_id"] is not None:
+                used_seg_ids[net["provider:network_type"]].append(
+                    net["provider:segmentation_id"])
+
+    return used_seg_ids
+
+
+def generate_new_segmentation_id(src_seg_ids, dst_seg_ids, network_type):
+    """Generate new segmentation ID based on provided info with busy ones.
+
+    Search for the lowest free segmentation ID. IDs '0' and '1' are reserved
+    in most of network types, so start searching from '2'.
+
+    For 'vlan' network type ID '4095' is the last one in available range and
+    besides also reserved. Raise AbortMigrationError if reach this ID.
+
+    :param src_seg_ids: Dictionary with busy segmentation IDs on SRC
+    :param dst_seg_ids: Dictionary with busy segmentation IDs on DST
+    :param network_type: Network type ('vlan', 'vxlan' or 'gre')
+
+    :result int: New generated free segmentation ID
+    """
+
+    src_seg_ids = set(src_seg_ids.get(network_type, []))
+    dst_seg_ids = set(dst_seg_ids.get(network_type, []))
+    busy_seg_ids = src_seg_ids | dst_seg_ids
+
+    free_seg_id = None
+    counter = 2
+
+    while free_seg_id is None:
+        if counter not in busy_seg_ids:
+            free_seg_id = counter
+        counter += 1
+
+    if free_seg_id >= 4095 and network_type == 'vlan':
+        raise exception.AbortMigrationError("Segmentation IDs limit for 'vlan'"
+                                            " network type has been exceeded")
+
+    return free_seg_id

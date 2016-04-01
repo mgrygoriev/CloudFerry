@@ -16,22 +16,23 @@ import logging
 import time
 import timeit
 import random
+import re
 import string
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from functools import wraps
 import json
-from jinja2 import Environment, FileSystemLoader
 import os
 import inspect
 from multiprocessing import Lock
+
+from jinja2 import Environment, FileSystemLoader
 from fabric.api import run, settings, local, env, sudo
 from fabric.context_managers import hide
-import ipaddr
 import yaml
-from logging import config
 
+LOG = logging.getLogger(__name__)
 
 ISCSI = "iscsi"
 CEPH = "ceph"
@@ -44,7 +45,6 @@ REMOTE_FILE = "remote file"
 QCOW2 = "qcow2"
 RAW = "raw"
 YES = "yes"
-LOGGING_CONFIG = 'configs/logging_config.yaml'
 PATH_TO_SNAPSHOTS = 'snapshots'
 AVAILABLE = 'available'
 IN_USE = 'in-use'
@@ -52,6 +52,7 @@ STATUS = 'status'
 
 DISK = "disk"
 DISK_EPHEM = "disk.local"
+DISK_CONFIG = "disk.config"
 LEN_UUID_INSTANCE = 36
 
 HOST_SRC = 'host_src'
@@ -67,6 +68,7 @@ SNAPSHOTS = 'snapshots'
 
 OBJSTORAGE_RESOURCE = 'objstorage'
 CONTAINERS = 'containers'
+CONTAINER_BODY = 'container'
 
 COMPUTE_RESOURCE = 'compute'
 INSTANCES_TYPE = 'instances'
@@ -87,7 +89,17 @@ IMAGE_BODY = 'image'
 
 IDENTITY_RESOURCE = 'identity'
 TENANTS_TYPE = 'tenants'
+USERS_TYPE = 'users'
 IGNORE = 'ignore'
+
+RESOURCE_TYPES = {
+    STORAGE_RESOURCE: VOLUMES_TYPE,
+    COMPUTE_RESOURCE: INSTANCES_TYPE,
+    NETWORK_RESOURCE: NETWORKS_TYPE,
+    IMAGE_RESOURCE: IMAGES_TYPE,
+    OBJSTORAGE_RESOURCE: CONTAINERS,
+    IDENTITY_RESOURCE: TENANTS_TYPE,
+}
 
 META_INFO = 'meta'
 OLD_ID = 'old_id'
@@ -95,6 +107,11 @@ OLD_ID = 'old_id'
 FILTER_PATH = 'configs/filter.yaml'
 
 up_ssh_tunnel = None
+
+SSH_CMD = \
+    "ssh -oStrictHostKeyChecking=no -L %s:%s:22 -R %s:localhost:%s %s -Nf"
+
+SSH_KEY_LIST_RE = re.compile(r'^\d+ [^ ]+ (?P<key_file>.+) [^ ]+$')
 
 
 class ext_dict(dict):
@@ -105,8 +122,8 @@ class ext_dict(dict):
 
 
 def get_snapshots_list_repository(path=PATH_TO_SNAPSHOTS):
-    path_source = path+'/source'
-    path_dest = path+'/dest'
+    path_source = path + '/source'
+    path_dest = path + '/dest'
     s = os.listdir(path_source)
     s.sort()
     source = [{'path': '%s/%s' % (path_source, f),
@@ -137,19 +154,22 @@ def convert_to_dict(obj, ident=0, limit_ident=6):
     ident += 1
     if type(obj) in primitive:
         return obj
-    if isinstance(obj, inspect.types.InstanceType) or (type(obj) not in (list, tuple, dict)):
+    if isinstance(obj, inspect.types.InstanceType) or \
+            (type(obj) not in (list, tuple, dict)):
         if ident <= limit_ident:
             try:
                 obj = obj.convert_to_dict()
-            except AttributeError as e:
+            except AttributeError:
                 try:
                     t = obj.__dict__
                     t['_type_class'] = str(obj.__class__)
                     obj = t
-                except AttributeError as e:
-                    return str(obj.__class__ if hasattr(obj, '__class__') else type(obj))
+                except AttributeError:
+                    return str(obj.__class__ if hasattr(obj, '__class__')
+                               else type(obj))
         else:
-            return str(obj.__class__ if hasattr(obj, '__class__') else type(obj))
+            return str(obj.__class__ if hasattr(obj, '__class__')
+                       else type(obj))
     if type(obj) is dict:
         res = {}
         for item in obj:
@@ -233,17 +253,6 @@ class Templater:
         temp_file.close()
         return temp_render
 
-with open(LOGGING_CONFIG, 'r') as logging_config:
-    # read config from file and store it as module global variable
-    config.dictConfig(yaml.load(logging_config))
-    LOGGER = logging.getLogger("CF")
-
-def configure_logging(level):
-    # redefine default logging level
-    LOGGER.setLevel(level)
-
-def get_log(name):
-    return LOGGER
 
 class StackCallFunctions(object):
     def __init__(self):
@@ -288,7 +297,8 @@ def log_step(log):
         @wraps(func)
         def inner(*args, **kwargs):
             stack_call_functions.append(func.__name__, args, kwargs)
-            log.info("%s> Step %s" % ("- - "*stack_call_functions.depth(), func.__name__))
+            log.info("%s> Step %s" % ("- - " * stack_call_functions.depth(),
+                                      func.__name__))
             res = func(*args, **kwargs)
             stack_call_functions.pop(res)
             return res
@@ -298,37 +308,15 @@ def log_step(log):
 
 class forward_agent(object):
     """
-        Forwarding ssh-key for access on to source and destination clouds via ssh
+        Forwarding ssh-key for access on to source and
+        destination clouds via ssh
     """
 
-    def __init__(self, key_file):
-        self.key_file = key_file
-
-    def _agent_already_running(self):
-        with settings(hide('warnings', 'running', 'stdout', 'stderr'),
-                      warn_only=True):
-            res = local("ssh-add -l", capture=True)
-
-            if res.succeeded:
-                present_keys = res.split(os.linesep)
-                for key in present_keys:
-                    # TODO: this will break for path with whitespaces
-                    key_path = key.split(' ')[2]
-                    if key_path == os.path.expanduser(self.key_file):
-                        return True
-
-        return False
+    def __init__(self, key_files):
+        self.key_files = key_files
 
     def __enter__(self):
-        if self._agent_already_running():
-            return
-        start_ssh_agent = ("eval `ssh-agent` && echo $SSH_AUTH_SOCK && "
-                           "ssh-add %s") % self.key_file
-        info_agent = local(start_ssh_agent, capture=True).split("\n")
-        self.pid = info_agent[0].split(" ")[-1]
-        self.ssh_auth_sock = info_agent[1]
-        os.environ["SSH_AGENT_PID"] = self.pid
-        os.environ["SSH_AUTH_SOCK"] = self.ssh_auth_sock
+        ensure_ssh_key_added(self.key_files)
 
     def __exit__(self, type, value, traceback):
         # never kill previously started ssh-agent, so that user only has to
@@ -336,10 +324,40 @@ class forward_agent(object):
         pass
 
 
+def ensure_ssh_key_added(key_files):
+    need_adding = set(os.path.abspath(os.path.expanduser(p))
+                      for p in key_files)
+    with settings(hide('warnings', 'running', 'stdout', 'stderr'),
+                  warn_only=True):
+        # First check already added keys
+        res = local("ssh-add -l", capture=True)
+        if res.succeeded:
+            for line in res.splitlines():
+                m = SSH_KEY_LIST_RE.match(line)
+                if not m:
+                    continue
+                path = os.path.abspath(os.path.expanduser(m.group('key_file')))
+                need_adding.discard(path)
+
+    with settings(hide('warnings', 'running', 'stdout', 'stderr')):
+        # Next add missing keys
+        if need_adding:
+            key_string = ' '.join(need_adding)
+            start_ssh_agent = ("eval `ssh-agent` && echo $SSH_AUTH_SOCK && "
+                               "ssh-add %s") % key_string
+            info_agent = local(start_ssh_agent, capture=True).splitlines()
+            os.environ["SSH_AGENT_PID"] = info_agent[0].split()[-1]
+            os.environ["SSH_AUTH_SOCK"] = info_agent[1]
+            return False
+        else:
+            return True
+
+
 class wrapper_singletone_ssh_tunnel:
 
     def __init__(self, interval_ssh="9000-9999", locker=Lock()):
-        self.interval_ssh = [int(interval_ssh.split('-')[0]), int(interval_ssh.split('-')[1])]
+        self.interval_ssh = [int(interval_ssh.split('-')[0]),
+                             int(interval_ssh.split('-')[1])]
         self.busy_port = []
         self.locker = locker
 
@@ -359,62 +377,80 @@ class wrapper_singletone_ssh_tunnel:
             if port in self.busy_port:
                 self.busy_port.remove(port)
 
-    def __call__(self, address_dest_compute, address_dest_controller, host, **kwargs):
-        return up_ssh_tunnel_class(address_dest_compute,
-                                   address_dest_controller,
-                                   host,
-                                   self.get_free_port,
-                                   self.free_port)
+    def __call__(self, address_dest_compute, address_dest_controller, host,
+                 **kwargs):
+        return UpSshTunnelClass(address_dest_compute,
+                                address_dest_controller,
+                                host,
+                                self.get_free_port,
+                                self.free_port)
 
 
-class up_ssh_tunnel_class:
+class UpSshTunnelClass:
 
     """
         Up ssh tunnel on dest controller node for transferring data
     """
 
-    def __init__(self, address_dest_compute, address_dest_controller, host, callback_get, callback_free):
+    def __init__(self, address_dest_compute, address_dest_controller, host,
+                 callback_get, callback_free):
         self.address_dest_compute = address_dest_compute
         self.address_dest_controller = address_dest_controller
         self.get_free_port = callback_get
         self.remove_port = callback_free
         self.host = host
-        self.cmd = "ssh -oStrictHostKeyChecking=no -L %s:%s:22 -R %s:localhost:%s %s -Nf"
+        self.cmd = SSH_CMD
 
     def __enter__(self):
         self.port = self.get_free_port()
-        with settings(host_string=self.host):
-            run(self.cmd % (self.port, self.address_dest_compute, self.port, self.port,
+        with settings(host_string=self.host,
+                      connection_attempts=env.connection_attempts):
+            run(self.cmd % (self.port,
+                            self.address_dest_compute,
+                            self.port,
+                            self.port,
                             self.address_dest_controller) + " && sleep 2")
         return self.port
 
     def __exit__(self, type, value, traceback):
-        with settings(host_string=self.host):
-            run(("pkill -f '"+self.cmd+"'") % (self.port, self.address_dest_compute, self.port, self.port,
-                                               self.address_dest_controller))
+        with settings(host_string=self.host,
+                      connection_attempts=env.connection_attempts):
+            run(("pkill -f '" + self.cmd + "'") %
+                (self.port,
+                 self.address_dest_compute,
+                 self.port,
+                 self.port,
+                 self.address_dest_controller))
         time.sleep(2)
         self.remove_port(self.port)
 
 
-class ChecksumImageInvalid(Exception):
-    def __init__(self, checksum_source, checksum_dest):
-        self.checksum_source = checksum_source
-        self.checksum_dest = checksum_dest
-
-    def __str__(self):
-        return repr("Checksum of image source = %s Checksum of image dest = %s" %
-                    (self.checksum_source, self.checksum_dest))
-
-
-def render_info(info_values, template_path="templates", template_file="info.html"):
+def render_info(info_values, template_path="templates",
+                template_file="info.html"):
     info_env = Environment(loader=FileSystemLoader(template_path))
     template = info_env.get_template(template_file)
     return template.render(info_values)
 
 
-def write_info(rendered_info, info_file = "source_info.html"):
+def write_info(rendered_info, info_file="source_info.html"):
     with open(info_file, "wb") as ifile:
         ifile.write(rendered_info)
+
+
+def libvirt_instance_exists(libvirt_name, init_host, compute_host, ssh_user,
+                            ssh_sudo_password):
+    with settings(host_string=compute_host,
+                  user=ssh_user,
+                  password=ssh_sudo_password,
+                  gateway=init_host,
+                  connection_attempts=env.connection_attempts,
+                  warn_only=True,
+                  quiet=True):
+        command = 'virsh domid %s' % libvirt_name
+        LOG.debug('[%s] Running command %s', compute_host, command)
+        out = sudo(command)
+        LOG.debug('[%s] Result of running %s: %s', compute_host, command, out)
+        return out.succeeded
 
 
 def get_libvirt_block_info(libvirt_name, init_host, compute_host, ssh_user,
@@ -422,8 +458,12 @@ def get_libvirt_block_info(libvirt_name, init_host, compute_host, ssh_user,
     with settings(host_string=compute_host,
                   user=ssh_user,
                   password=ssh_sudo_password,
-                  gateway=init_host):
-        out = sudo("virsh domblklist %s" % libvirt_name)
+                  gateway=init_host,
+                  connection_attempts=env.connection_attempts):
+        command = "virsh domblklist %s" % libvirt_name
+        LOG.debug('[%s] Running command %s', compute_host, command)
+        out = sudo(command)
+        LOG.debug('[%s] Result of running %s: %s', compute_host, command, out)
         libvirt_output = out.split()
     return libvirt_output
 
@@ -435,7 +475,8 @@ def find_element_by_in(list_values, word):
 
 
 def init_singletones(cfg):
-    globals()['up_ssh_tunnel'] = wrapper_singletone_ssh_tunnel(cfg.migrate.ssh_transfer_port)
+    globals()['up_ssh_tunnel'] = wrapper_singletone_ssh_tunnel(
+        cfg.migrate.ssh_transfer_port)
 
 
 def get_disk_path(instance, blk_list, is_ceph_ephemeral=False, disk=DISK):
@@ -453,32 +494,6 @@ def get_disk_path(instance, blk_list, is_ceph_ephemeral=False, disk=DISK):
             if ("compute/%s%s" % (instance.id, disk)) == i:
                 disk_path = i
     return disk_path
-
-
-def get_ips(init_host, compute_host, ssh_user):
-    with settings(host_string=compute_host,
-                  user=ssh_user,
-                  gateway=init_host):
-        cmd = ("ifconfig | awk -F \"[: ]+\" \'/inet addr:/ "
-               "{ if ($4 != \"127.0.0.1\") print $4 }\'")
-        out = run(cmd)
-        list_ips = []
-        for info in out.split():
-            try:
-                ip = ipaddr.IPAddress(info)
-            except ValueError:
-                continue
-            list_ips.append(info)
-    return list_ips
-
-
-def get_ext_ip(ext_cidr, init_host, compute_host, ssh_user):
-    list_ips = get_ips(init_host, compute_host, ssh_user)
-    for ip_str in list_ips:
-        ip_addr = ipaddr.IPAddress(ip_str)
-        if ipaddr.IPNetwork(ext_cidr).Contains(ip_addr):
-            return ip_str
-    return None
 
 
 def check_file(file_path):

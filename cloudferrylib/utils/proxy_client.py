@@ -11,8 +11,14 @@
 # implied.
 # See the License for the specific language governing permissions and#
 # limitations under the License.
-import time
+import contextlib
 import inspect
+import threading
+import time
+
+from cloudferrylib.utils import log
+
+LOG = log.getLogger(__name__)
 method_wrapper = type(object().__str__)
 
 base_types = [inspect.types.BooleanType,
@@ -43,6 +49,7 @@ base_types = [inspect.types.BooleanType,
               inspect.types.TypeType,
               inspect.types.UnicodeType,
               inspect.types.XRangeType]
+tls = threading.local()
 
 
 def is_wrapping(x):
@@ -53,7 +60,7 @@ def is_wrapping(x):
     return True
 
 
-class Proxy:
+class Proxy(object):
     def __init__(self, client, retry, wait_time):
         self.client = client
         self.retry = retry
@@ -63,23 +70,44 @@ class Proxy:
         time.sleep(self.wait_time)
 
     def __call__(self, *args, **kwargs):
-        c = 0
+        count = 0
         result = None
         is_retry = True
         while is_retry:
             try:
                 result = self.client(*args, **kwargs)
                 is_retry = False
-            except Exception as e:
-                if c < self.retry:
-                    c += 1
+            except Exception as ex:  # pylint: disable=broad-except
+                expected_exceptions = getattr(tls, 'expected_exceptions', ())
+                for expected_exception in expected_exceptions:
+                    if isinstance(ex, expected_exception):
+                        raise
+                LOG.warning('Error happened while calling client',
+                            exc_info=True)
+                if count < self.retry:
+                    count += 1
                     self.wait()
                 else:
-                    raise e
+                    raise
         return result
 
     def __getattr__(self, name):
         attr = getattr(self.client, name)
-        if inspect.ismethod(attr) or (type(attr) is method_wrapper) or is_wrapping(attr):
+        if inspect.ismethod(attr) or \
+                (type(attr) is method_wrapper) or \
+                is_wrapping(attr):
             return Proxy(attr, self.retry, self.wait_time)
         return attr
+
+
+@contextlib.contextmanager
+def expect_exception(*exception_classes):
+    old_expected_exceptions = getattr(tls, 'expected_exceptions', None)
+    tls.expected_exceptions = exception_classes
+    try:
+        yield
+    finally:
+        if old_expected_exceptions is None:
+            delattr(tls, 'expected_exceptions')
+        else:
+            tls.expected_exceptions = old_expected_exceptions

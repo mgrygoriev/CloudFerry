@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and#
 # limitations under the License.
 
-__author__ = 'mirrorcoder'
 from cloudferrylib.scheduler.cursor import DEFAULT
 from cloudferrylib.scheduler.utils.equ_instance import EquInstance
 
@@ -65,7 +64,8 @@ class ClassicSyntax(Element):
     def dual_link_with(self, other):
         other = other.go_start()
         self.next_element[0] = other
-        other.prev_element = self if not other.prev_element else other.prev_element
+        other.prev_element = self if not other.prev_element \
+            else other.prev_element
         return other.go_end()
 
 
@@ -98,10 +98,8 @@ class BaseTask(AltSyntax, EquInstance):
             namespace.vars.update(result)
 
     def __repr__(self):
-        return "BaseTask|%s" % self.__class__.__name__
+        return self.__class__.__name__
 
 
 class Task(BaseTask):
     pass
-
-

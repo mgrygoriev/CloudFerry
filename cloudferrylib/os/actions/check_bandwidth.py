@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and#
 # limitations under the License.
 
-
 import os
 import subprocess
 import uuid
@@ -22,17 +21,39 @@ from fabric.api import env
 from cloudferrylib.base.action import action
 from cloudferrylib.utils import cmd_cfg
 from cloudferrylib.utils import files
+from cloudferrylib.utils import log
 from cloudferrylib.utils import remote_runner
+from cloudferrylib.utils import ssh_util
 from cloudferrylib.utils import utils
 
 
-LOG = utils.get_log(__name__)
+LOG = log.getLogger(__name__)
 
 
 class CheckBandwidth(action.Action):
+    """Assesses networking bandwidth between CloudFerry node and controller
+    node defined in `[src|dst] host` config variable.
+
+    Process:
+     1. Generate file of size `[initial_check] test_file_size` on CF node;
+     2. Copy generated file to `[src|dst] host` over network (scp);
+     3. Measure time required for file to be copied over;
+     4. Calculate networking bandwidth based on measuring above;
+     5. If bandwidth is smaller than `[initial_check] claimed_bandwidth` *
+        `[initial_check] factor` - stop migration and display error message.
+
+    Config options:
+     - `[initial_check] test_file_size` - size of the file to be copied over;
+     - `[initial_check] claimed_bandwidth` - expected bandwidth;
+     - `[initial_check] factor` - fraction of 1 for the lowest acceptable
+        bandwidth, e.g. `factor = 0.5` means expected bandwidth should not get
+        below `0.5 * claimed_bandwidth`;
+     - `[src|dst] host` - host the file will be copied to.
+    """
+
     def run(self, **kwargs):
         cfg = self.cloud.cloud_config.cloud
-        runner = remote_runner.RemoteRunner(cfg.host, cfg.ssh_user)
+        runner = remote_runner.RemoteRunner(cfg.ssh_host, cfg.ssh_user)
 
         temp_dir_name = os.popen('mktemp -dt check_band_XXXX').read().rstrip()
         temp_file_name = str(uuid.uuid4())
@@ -49,23 +70,28 @@ class CheckBandwidth(action.Action):
         remote_file_path = os.path.join(temp_dir_name,
                                         temp_file_name)
 
-        scp_upload = cmd_cfg.scp_cmd('',
+        scp_upload = cmd_cfg.scp_cmd(ssh_util.get_cipher_option(),
+                                     '',
                                      ssh_user,
-                                     self.cloud.cloud_config.cloud.ssh_host,
+                                     cfg.ssh_host,
                                      remote_file_path,
                                      temp_dir_name)
 
-        scp_download = cmd_cfg.scp_cmd(local_file_path,
+        scp_download = cmd_cfg.scp_cmd(ssh_util.get_cipher_option(),
+                                       local_file_path,
                                        ssh_user,
-                                       self.cloud.cloud_config.cloud.ssh_host,
+                                       cfg.ssh_host,
                                        temp_dir_name,
                                        '')
 
         with files.RemoteDir(runner, temp_dir_name):
             try:
                 with utils.forward_agent(env.key_filename):
-                    dd_command = cmd_cfg.dd_full('/dev/zero', remote_file_path, 1,
-                                                 0, test_file_size)
+                    dd_command = cmd_cfg.dd_full('/dev/zero',
+                                                 remote_file_path,
+                                                 1,
+                                                 0,
+                                                 test_file_size)
                     self.cloud.ssh_util.execute(dd_command)
 
                     LOG.info("Checking upload speed... Wait please.")

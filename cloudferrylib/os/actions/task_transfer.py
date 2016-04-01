@@ -14,18 +14,19 @@
 
 
 from cloudferrylib.base.action import action
-from cloudferrylib.utils import utils as utl
+from cloudferrylib.copy_engines import base
+from cloudferrylib.utils import utils
 
 
 class TaskTransfer(action.Action):
-    def __init__(self, init, driver,
+    def __init__(self, init,
+                 driver=None,
                  input_info='info',
-                 resource_name=utl.VOLUMES_TYPE,
-                 resource_root_name=utl.VOLUME_BODY):
+                 resource_name=utils.VOLUMES_TYPE,
+                 resource_root_name=utils.VOLUME_BODY):
         super(TaskTransfer, self).__init__(init)
-        self.driver = self.init[driver](self.src_cloud,
-                                        self.dst_cloud,
-                                        self.cfg)
+        self.driver = base.get_copier_class(driver)(self.src_cloud,
+                                                    self.dst_cloud)
         self.resource_name = resource_name
         self.resource_root_name = resource_root_name
         self.input_info = input_info
@@ -36,6 +37,7 @@ class TaskTransfer(action.Action):
 
         for item in data_for_trans.itervalues():
             data = item[self.resource_root_name]
-            self.driver.transfer(data)
+            if self.driver.check_usage(data):
+                self.driver.transfer(data)
 
         return {}

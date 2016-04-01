@@ -12,7 +12,13 @@
 # See the License for the specific language governing permissions and#
 # limitations under the License.
 
+import time
+
+from cloudferrylib.base import exception
+from cloudferrylib.utils import log
 from cloudferrylib.utils import proxy_client
+
+LOG = log.getLogger(__name__)
 
 
 class Resource(object):
@@ -24,10 +30,10 @@ class Resource(object):
         time_wait = cfg.migrate.time_wait
         return proxy_client.Proxy(client, retry, time_wait)
 
-    def read_info(self, opts={}):
+    def read_info(self, opts=None):
         pass
 
-    def deploy(self, *args):
+    def deploy(self, *args, **kwargs):
         pass
 
     def save(self):
@@ -36,8 +42,50 @@ class Resource(object):
     def restore(self):
         pass
 
-    def wait_for_status(self, id_obj, status, limit_retry=60):
-        pass
+    def required_tenants(
+            self,
+            filter_tenant_id=None):  # pylint: disable=unused-argument
+        """Returns list of tenants required by resource. Important for the
+        filtering feature."""
+        return []
+
+    def wait_for_status(self, res_id, get_status, wait_status, timeout=60,
+                        stop_statuses=None):
+        LOG.debug("Waiting for status change")
+        delay = 1
+        stop_statuses = [s.lower() for s in (stop_statuses or [])]
+        if 'error' not in stop_statuses:
+            stop_statuses.append('error')
+        while delay < timeout:
+            actual_status = get_status(res_id).lower()
+            LOG.debug("Expected status is '%s', actual - '%s', "
+                      "stop statuses - %s",
+                      wait_status, actual_status, stop_statuses)
+            if actual_status in stop_statuses:
+                LOG.debug("Stop status reached, exit")
+                raise exception.TimeoutException(
+                    get_status(res_id).lower(),
+                    wait_status, "Timed out waiting for state change")
+            elif actual_status == wait_status.lower():
+                LOG.debug("Expected status reached, exit")
+                break
+
+            LOG.debug("Expected status NOT reached, waiting")
+
+            time.sleep(delay)
+            delay *= 2
+        else:
+            LOG.debug("Timed out waiting for state change")
+            raise exception.TimeoutException(
+                get_status(res_id).lower(),
+                wait_status, "Timed out waiting for state change")
+
+    def try_wait_for_status(self, res_id, get_status, wait_status, timeout=60):
+        try:
+            self.wait_for_status(res_id, get_status, wait_status, timeout)
+        except exception.TimeoutException as e:
+            LOG.warning("Resource '%s' has not changed status to '%s'(%s)",
+                        res_id, wait_status, e)
 
     def get_status(self, resource_id):
         pass

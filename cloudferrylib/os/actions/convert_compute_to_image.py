@@ -16,7 +16,12 @@
 import copy
 
 from cloudferrylib.base.action import action
+from cloudferrylib.base import exception
+from cloudferrylib.utils import log
 from cloudferrylib.utils import utils as utl
+
+
+LOG = log.getLogger(__name__)
 
 
 def get_boot_volume(instance):
@@ -40,10 +45,13 @@ class ConvertComputeToImage(action.Action):
         image_info = {utl.IMAGES_TYPE: {}}
         images_body = image_info[utl.IMAGES_TYPE]
         image_resource = self.cloud.resources[utl.IMAGE_RESOURCE]
+        dst_image_resource = self.dst_cloud.resources[utl.IMAGE_RESOURCE]
         storage_resource = self.cloud.resources[utl.STORAGE_RESOURCE]
         compute_ignored_images = {}
+        missing_images = {}
         for instance_id, instance in info[utl.INSTANCES_TYPE].iteritems():
             _instance = instance[utl.INSTANCE_BODY]
+            image_id = None
             if _instance['boot_mode'] == utl.BOOT_FROM_VOLUME:
                 if _instance['volumes']:
                     volume = get_boot_volume(instance)
@@ -52,9 +60,7 @@ class ConvertComputeToImage(action.Action):
             else:
                 image_id = _instance['image_id']
             # TODO: Case when image is None
-            if image_id:
-                img = image_resource.read_info(image_id=image_id)
-                img = img[utl.IMAGES_TYPE]
+            if image_id and not dst_image_resource.image_exists(image_id):
                 if image_id in images_body:
                     images_body[image_id][utl.META_INFO][
                         utl.INSTANCE_BODY].append(instance)
@@ -62,13 +68,27 @@ class ConvertComputeToImage(action.Action):
                     images_body[image_id] = {utl.IMAGE_BODY: {},
                                              utl.META_INFO: {
                                              utl.INSTANCE_BODY: [instance]}}
+                    try:
+                        image_resource.get_ref_image(image_id)
+                    except exception.ImageDownloadError:
+                        missing_images[instance_id] = image_id
+                        continue
+                    img = image_resource.get_image_by_id_converted(image_id)
+                    img = img[utl.IMAGES_TYPE]
                     if img:
                         images_body.update(img)
                         images_body[image_id][utl.META_INFO][
                             utl.INSTANCE_BODY] = [instance]
+                    else:
+                        LOG.warning("No boot image for instance, "
+                                    "need to re-create it")
+                        missing_images[instance_id] = image_id
             else:
                 compute_ignored_images[instance_id] = instance
+        if missing_images:
+            LOG.warning('List of broken images: %s', missing_images.values())
         return {
             self.target_output: image_info,
-            'compute_ignored_images': compute_ignored_images
+            'compute_ignored_images': compute_ignored_images,
+            'missing_images': missing_images
         }

@@ -15,18 +15,9 @@
 
 import copy
 
-from fabric.api import env
-from fabric.api import run
-from fabric.api import settings
-
 from cloudferrylib.base.action import action
-from cloudferrylib.os.actions import convert_file_to_image
-from cloudferrylib.os.actions import convert_image_to_file
-from cloudferrylib.os.actions import convert_volume_to_image
-from cloudferrylib.os.actions import copy_g2g
-from cloudferrylib.os.actions import task_transfer
 from cloudferrylib.os.identity import keystone
-from cloudferrylib.utils import utils as utl, forward_agent
+from cloudferrylib.utils import utils as utl
 
 
 CLOUD = 'cloud'
@@ -67,7 +58,7 @@ class TransportInstance(action.Action):
             }
         }
 
-        #Get next one instance
+        # Get next one instance
         for instance_id, instance in info[utl.INSTANCES_TYPE].iteritems():
             instance = self._replace_user_ids(instance)
 
@@ -114,22 +105,22 @@ class TransportInstance(action.Action):
             instance_new = new_info[INSTANCES][new_id]
 
             ephemeral_path_dst = instance_new[EPHEMERAL][PATH_SRC]
-            instance_new[EPHEMERAL][PATH_DST] = ephemeral_path_dst            
+            instance_new[EPHEMERAL][PATH_DST] = ephemeral_path_dst
             ephemeral_host_dst = instance_new[EPHEMERAL][HOST_SRC]
             instance_new[EPHEMERAL][HOST_DST] = ephemeral_host_dst
-            
+
             diff_path_dst = instance_new[DIFF][PATH_SRC]
-            instance_new[DIFF][PATH_DST] = diff_path_dst            
+            instance_new[DIFF][PATH_DST] = diff_path_dst
             diff_host_dst = instance_new[DIFF][HOST_SRC]
             instance_new[DIFF][HOST_DST] = diff_host_dst
 
             ephemeral_path_src = instance_old[EPHEMERAL][PATH_SRC]
-            instance_new[EPHEMERAL][PATH_SRC] = ephemeral_path_src            
+            instance_new[EPHEMERAL][PATH_SRC] = ephemeral_path_src
             ephemeral_host_src = instance_old[EPHEMERAL][HOST_SRC]
             instance_new[EPHEMERAL][HOST_SRC] = ephemeral_host_src
-            
+
             diff_path_src = instance_old[DIFF][PATH_SRC]
-            instance_new[DIFF][PATH_SRC] = diff_path_src            
+            instance_new[DIFF][PATH_SRC] = diff_path_src
             diff_host_src = instance_old[DIFF][HOST_SRC]
             instance_new[DIFF][HOST_SRC] = diff_host_src
 

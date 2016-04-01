@@ -11,12 +11,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+import logging
+import math
 import os
 
-from cloudferrylib.utils import utils
+from fabric import api
+from fabric import state
+
+import cfglib
+
+from cloudferrylib.utils import remote_runner
 
 
-LOG = utils.get_log(__name__)
+LOG = logging.getLogger(__name__)
+CONF = cfglib.CONF
 
 
 class RemoteSymlink(object):
@@ -26,83 +35,139 @@ class RemoteSymlink(object):
         self.symlink = symlink_name
 
     def __enter__(self):
-        cmd = "ln --symbolic {file} {symlink_name}".format(
-            file=self.target, symlink_name=self.symlink)
-        self.runner.run(cmd)
+        if self.target is None:
+            return
+
+        cmd = "ln --symbolic {file} {symlink_name}"
+        self.runner.run(cmd, file=self.target, symlink_name=self.symlink)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self.runner.run_ignoring_errors(_unlink(self.symlink))
+        if self.target is None:
+            return
+        remote_rm(self.runner, self.symlink, ignoring_errors=True)
         return self
 
 
 class RemoteTempFile(object):
     def __init__(self, runner, filename, text):
         self.runner = runner
-        self.filename = os.path.join('/tmp', '{}'.format(filename))
+        self.filename = os.path.join('/tmp', filename)
         self.text = text
 
     def __enter__(self):
-        cmd = "echo '{text}' > {file}".format(text=self.text,
-                                              file=self.filename)
-        self.runner.run(cmd)
+        cmd = "echo '{text}' > {filename}"
+        self.runner.run(cmd, text=self.text, filename=self.filename)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self.runner.run_ignoring_errors(_unlink(self.filename))
+        remote_rm(self.runner, self.filename, ignoring_errors=True)
         return self
 
 
 class RemoteDir(object):
     def __init__(self, runner, dirname):
         self.runner = runner
-        if dirname == '/':
-            raise ValueError("The directory / is not allowed")
-        else:
-            self.dirname = dirname
+        self.dirname = dirname
 
     def __enter__(self):
-        cmd = "mkdir -p {dir}".format(dir=self.dirname)
-        self.runner.run(cmd)
+        cmd = "mkdir -p {dir}"
+        self.runner.run(cmd, dir=self.dirname)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self.runner.run_ignoring_errors(_unlink_dir(self.dirname))
-        return self
+        remote_rm(self.runner, self.dirname, recursive=True,
+                  ignoring_errors=True)
 
 
-class GetTempDir(object):
-    def __init__(self, runner, prefix):
-        self.runner = runner
-        self.prefix = prefix
-
-    def get(self):
-        cmd = "mktemp -udt %s_XXXX" % self.prefix
-        return self.runner.run(cmd)
-
-
-def _unlink(filename):
-    return "rm -f {file}".format(file=filename)
+def is_installed(runner, cmd):
+    try:
+        is_installed_cmd = "type {cmd} >/dev/null 2>&1".format(cmd=cmd)
+        runner.run(is_installed_cmd)
+        return True
+    except remote_runner.RemoteExecutionError:
+        return False
 
 
-def _unlink_dir(dirname):
-    if len(dirname) > 1:
-        return "rm -rf {dir}".format(dir=dirname)
-    else:
-        raise RuntimeError('Wrong dirname %s, stopping' % dirname)
+class RemoteStdout(object):
+    def __init__(self, host, user, cmd, **kwargs):
+        self.host = host
+        self.user = user
+        if kwargs:
+            cmd = cmd.format(**kwargs)
+        self.cmd = cmd
+        self.stdin = None
+        self.stdout = None
+        self.stderr = None
 
-
-class RemoteTempDir(object):
-    """Creates remote temp dir using `mktemp` and removes it on scope exit"""
-
-    def __init__(self, runner):
-        self.runner = runner
+    def run(self):
+        with api.settings(
+                host_string=self.host,
+                user=self.user,
+                combine_stderr=False,
+                connection_attempts=CONF.migrate.ssh_connection_attempts,
+                reject_unkown_hosts=False,
+        ):
+            conn = state.connections[self.host]
+            return conn.exec_command(self.cmd)
 
     def __enter__(self):
-        create_temp_dir = 'mktemp -d'
-        self.created_dir = self.runner.run(create_temp_dir)
-        return self.created_dir
+        self.stdin, self.stdout, self.stderr = self.run()
+        return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        remove_dir = 'rm -rf {dir}'.format(dir=self.created_dir)
-        self.runner.run_ignoring_errors(remove_dir)
+        if self.stdin:
+            self.stdin.close()
+        if self.stdout:
+            self.stdout.close()
+        if self.stderr:
+            self.stderr.close()
+        if all((exc_type, exc_val, exc_tb)):
+            raise exc_type, exc_val, exc_tb
+
+
+def remote_file_size(runner, path):
+    return int(runner.run('stat --printf="%s" {path}', path=path))
+
+
+def remote_file_size_mb(runner, path):
+    return int(math.ceil(remote_file_size(runner, path) / (1024.0 * 1024.0)))
+
+
+def remote_md5_sum(runner, path):
+    get_md5 = "md5sum {path} | awk '{{ print $1 }}'"
+    return runner.run(get_md5, path=path)
+
+
+def remote_rm(runner, path, recursive=False, ignoring_errors=False):
+    options = 'f'
+    if recursive:
+        options += 'r'
+    cmd = "rm -{options} {path}"
+    run = runner.run_ignoring_errors if ignoring_errors else runner.run
+    run(cmd, options=options, path=path)
+
+
+def remote_gzip(runner, path):
+    cmd = "gzip -f {path}"
+    runner.run(cmd, path=path)
+    return path + ".gz"
+
+
+def remote_split_file(runner, input, output, start, block_size):
+    cmd = ("dd if={input} of={output} skip={start} bs={block_size}M "
+           "count=1")
+    runner.run(cmd, input=input, output=output, block_size=block_size,
+               start=start)
+
+
+def remote_unzip(runner, path):
+    cmd = "gzip -f -d {path}"
+    runner.run(cmd, path=path)
+
+
+def remote_join_file(runner, dest_file, part, start, block_size):
+    cmd = ("dd if={part} of={dest} seek={start} bs={block_size}M "
+           "count=1")
+    runner.run(cmd, part=part, dest=dest_file, start=start,
+               block_size=block_size)

@@ -14,7 +14,10 @@
 #    under the License.
 
 import mock
+
 from oslotest import base
+
+import cfglib
 
 
 class TestCase(base.BaseTestCase):
@@ -23,3 +26,15 @@ class TestCase(base.BaseTestCase):
     def setUp(self):
         super(TestCase, self).setUp()
         self.addCleanup(mock.patch.stopall)
+        self.cfg = cfglib.CONF
+        self.addCleanup(self.cfg.reset)
+        cfglib.init_config()
+
+    def assertIsZero(self, observed, message=''):
+        self.assertEqual(0, observed, message)
+
+    def assertCalledOnce(self, mock_obj, message=''):
+        message = message or ("Expected '%s' to be called once. "
+                              "Called %s times." % (mock_obj,
+                                                    mock_obj.call_count))
+        self.assertEqual(1, mock_obj.call_count, message)

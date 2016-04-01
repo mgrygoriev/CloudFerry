@@ -14,16 +14,21 @@
 
 
 import copy
+import hashlib
+import os
 
 from fabric.api import env
 from fabric.api import run
 from fabric.api import settings
+from oslo_config import cfg
 
 from cloudferrylib.base.action import action
 from cloudferrylib.os.actions import task_transfer
-from cloudferrylib.utils import forward_agent
+from cloudferrylib.utils.utils import forward_agent
 from cloudferrylib.utils import utils as utl
+from cloudferrylib.utils import qemu_img as qemu_img_util
 
+CONF = cfg.CONF
 
 CLOUD = 'cloud'
 BACKEND = 'backend'
@@ -46,8 +51,6 @@ BACKING_FILE_DST = 'backing_file_dst'
 
 TEMP = 'temp'
 FLAVORS = 'flavors'
-
-SSH_CHUNKS = 'CopyFilesBetweenComputeHosts'
 
 TRANSPORTER_MAP = {CEPH: {CEPH: 'SSHCephToCeph',
                           ISCSI: 'SSHCephToFile'},
@@ -85,9 +88,11 @@ class TransportEphemeral(action.Action):
             'info': new_info
         }
 
-    def delete_remote_file_on_compute(self, path_file, host_cloud,
+    @staticmethod
+    def delete_remote_file_on_compute(path_file, host_cloud,
                                       host_instance):
-        with settings(host_string=host_cloud):
+        with settings(host_string=host_cloud,
+                      connection_attempts=env.connection_attempts):
             with forward_agent(env.key_filename):
                 run("ssh -oStrictHostKeyChecking=no %s  'rm -rf %s'" %
                     (host_instance, path_file))
@@ -98,8 +103,8 @@ class TransportEphemeral(action.Action):
         src_compute = src_cloud.resources[resources]
         src_backend = src_compute.config.compute.backend
         dst_backend = dst_storage.config.compute.backend
-        ssh_driver = (SSH_CHUNKS
-                      if self.cfg.migrate.direct_compute_transfer
+        ssh_driver = (CONF.migrate.copy_backend
+                      if CONF.migrate.direct_compute_transfer
                       else TRANSPORTER_MAP[src_backend][dst_backend])
         transporter = task_transfer.TaskTransfer(
             self.init,
@@ -124,6 +129,7 @@ class TransportEphemeral(action.Action):
                                    utl.EPHEMERAL_BODY,
                                    utl.COMPUTE_RESOURCE,
                                    utl.INSTANCES_TYPE)
+            self.rebase_diff(dst_cloud, info)
 
     def copy_ephemeral_ceph_to_iscsi(self, src_cloud, dst_cloud, info):
         transporter = task_transfer.TaskTransfer(
@@ -134,11 +140,11 @@ class TransportEphemeral(action.Action):
 
         instances = info[utl.INSTANCES_TYPE]
         temp_src = src_cloud.cloud_config.cloud.temp
-        host_dst = dst_cloud.getIpSsh()
+        host_dst = dst_cloud.cloud_config.cloud.ssh_host
         qemu_img_dst = dst_cloud.qemu_img
         qemu_img_src = src_cloud.qemu_img
 
-        temp_path_src = temp_src+"/%s"+utl.DISK_EPHEM
+        temp_path_src = temp_src + "/%s" + utl.DISK_EPHEM
         for inst_id, inst in instances.iteritems():
 
             path_src_id_temp = temp_path_src % inst_id
@@ -183,3 +189,19 @@ class TransportEphemeral(action.Action):
             inst[EPHEMERAL][PATH_SRC] = path_src_temp_raw
 
         transporter.run(info=info)
+
+    @staticmethod
+    def rebase_diff(dst_cloud, info):
+        for instance_id, obj in info[utl.INSTANCES_TYPE].items():
+            image_id = obj['instance']['image_id']
+            new_backing_file = hashlib.sha1(image_id).hexdigest()
+            diff = obj['diff']
+            host = diff['host_dst']
+            qemu_img = qemu_img_util.QemuImg(dst_cloud.config.dst,
+                                             dst_cloud.config.migrate,
+                                             host)
+            diff_path = diff['path_dst']
+            backing_path = qemu_img.detect_backing_file(diff_path, None)
+            backing_dir = os.path.dirname(backing_path)
+            new_backing_path = os.path.join(backing_dir, new_backing_file)
+            qemu_img.diff_rebase(new_backing_path, diff_path)

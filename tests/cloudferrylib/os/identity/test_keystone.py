@@ -31,16 +31,20 @@ FAKE_CONFIG = utils.ext_dict(
                           'password': 'fake_password',
                           'tenant': 'fake_tenant',
                           'auth_url': 'http://1.1.1.1:35357/v2.0/',
-                          'service_tenant': 'service'}),
-    migrate=utils.ext_dict({'speed_limit': '10MB',
-                            'retry': '7',
+                          'region': None,
+                          'service_tenant': 'service',
+                          'cacert': '',
+                          'insecure': False}),
+    migrate=utils.ext_dict({'retry': '7',
                             'time_wait': 5,
                             'keep_user_passwords': False,
                             'overwrite_user_passwords': False,
-                            'migrate_users': True}),
+                            'migrate_users': True,
+                            'optimize_user_role_fetch': False}),
     mail=utils.ext_dict({'server': '-'}))
 
 
+@mock.patch("cloudferrylib.base.clients.os_cli_cmd", mock.MagicMock())
 class KeystoneIdentityTestCase(test.TestCase):
     def setUp(self):
         super(KeystoneIdentityTestCase, self).setUp()
@@ -81,28 +85,63 @@ class KeystoneIdentityTestCase(test.TestCase):
         self.fake_role_1.name = 'role_name_1'
         self.fake_role_1.id = 'role_id_1'
 
-        self.fake_src_keystone = mock.Mock()
-        self.fake_dst_keystone = mock.Mock()
-        self.fake_src_keystone.keystone_client.users.find.side_effect = (
-            self.mock_user_find)
-        self.fake_dst_keystone.keystone_client.users.find.side_effect = (
-            self.mock_user_find)
-
         cfglib.init_config()
         cfglib.CONF.src.user = 'src_admin_user'
         cfglib.CONF.dst.user = 'dst_admin_user'
 
         self.fake_src_admin_user = mock.Mock()
+        self.fake_src_admin_user.name = 'src_admin_user'
         self.fake_dst_admin_user = mock.Mock()
+        self.fake_dst_admin_user.name = 'dst_admin_user'
 
         self.fake_same_user = mock.Mock()
         self.fake_same_user.id = 'fake_same_id'
         self.fake_same_user.name = 'fake_same_name'
 
+        src_keystone = mock.Mock()
+        dst_keystone = mock.Mock()
+        self.fake_src_keystone = src_keystone
+        self.fake_dst_keystone = dst_keystone
+        src_keystone.keystone_client.users.list.return_value = [
+            self.fake_user_0,
+            self.fake_same_user,
+            self.fake_src_admin_user]
+        dst_keystone.keystone_client.users.list.return_value = [
+            self.fake_user_1,
+            self.fake_same_user,
+            self.fake_dst_admin_user]
+        src_keystone.keystone_client.users.get.side_effect = self.mock_user_get
+        dst_keystone.keystone_client.users.get.side_effect = self.mock_user_get
+        src_keystone.try_get_user_by_name.side_effect = self.mock_user_get
+        dst_keystone.try_get_user_by_name.side_effect = self.mock_user_get
+
     def test_get_client_generates_new_token(self):
         client1 = self.keystone_client.keystone_client
         client2 = self.keystone_client.keystone_client
         self.assertFalse(client1 == client2)
+
+    @mock.patch("time.sleep")
+    @mock.patch.object(keystone_client, "Client")
+    def test_retry_when_get_client_with_exception(self, mock_call,
+                                                  sleep_mock):
+        """
+         side effect is defined with two exceptions during get_client :
+         One is Expected - exceptions.Unauthorized
+         Another is Unexpected -  exceptions.AuthorizationFailure
+        """
+
+        # retry check when expected exception occurs
+        mock_call.side_effect = exceptions.Unauthorized
+        self.assertRaises(exceptions.Unauthorized,
+                          self.keystone_client.get_client)
+        self.assertFalse(sleep_mock.called)
+
+        # retry check when unexpected exception occurs
+        mock_call.reset_mock()
+        mock_call.side_effect = exceptions.AuthorizationFailure
+        self.assertRaises(exceptions.AuthorizationFailure,
+                          self.keystone_client.get_client)
+        self.assertTrue(sleep_mock.called)
 
     def test_get_tenants_list(self):
         fake_tenants_list = [self.fake_tenant_0, self.fake_tenant_1]
@@ -122,17 +161,9 @@ class KeystoneIdentityTestCase(test.TestCase):
 
     def test_get_tenant_by_name_default(self):
         self.mock_client().tenants.list.return_value = []
-
-        tenant = self.keystone_client.get_tenant_by_name('tenant_name_0')
-
-        self.assertIsNone(tenant)
-
-    def test_get_tenant_by_id(self):
-        self.mock_client().tenants.get.return_value = self.fake_tenant_0
-
-        tenant = self.keystone_client.get_tenant_by_id('tenant_id_0')
-
-        self.assertEqual(self.fake_tenant_0, tenant)
+        self.assertRaises(
+            exceptions.NotFound,
+            self.keystone_client.get_tenant_by_name, 'tenant_name_0')
 
     def test_get_users_list(self):
         fake_users_list = [self.fake_user_0, self.fake_user_1]
@@ -214,6 +245,9 @@ class KeystoneIdentityTestCase(test.TestCase):
         self.mock_client().tenants.list.return_value = fake_tenants_list
         self.mock_client().users.list.return_value = fake_users_list
         self.mock_client().roles.list.return_value = fake_roles_list
+        self.keystone_client._get_user_roles_cached = mock.MagicMock()
+        self.keystone_client._get_user_roles_cached.return_value = \
+            mock.MagicMock().return_value = [self.fake_role_0]
         self.mock_client().roles.roles_for_user.return_value = [
             self.fake_role_0]
 
@@ -301,17 +335,18 @@ class KeystoneIdentityTestCase(test.TestCase):
                  'meta': {}})
         return fake_info
 
-    def mock_user_find(self, id=None, name=None):
+    def mock_user_get(self, id, default=None):
         map_dict = {'user_id_0': self.fake_user_0,
                     'user_name_1': self.fake_user_1,
                     'fake_same_id': self.fake_same_user,
                     'fake_same_name': self.fake_same_user,
                     'src_admin_user_id': self.fake_src_admin_user,
                     'dst_admin_user': self.fake_dst_admin_user}
-        key = id or name
         try:
-            return map_dict[key]
+            return map_dict[id]
         except KeyError:
+            if default is not None:
+                return map_dict[default]
             raise exceptions.NotFound
 
     def test_get_dst_user_from_src_user_id_0(self):
@@ -421,9 +456,87 @@ class KeystoneIdentityTestCase(test.TestCase):
         self.assertEquals(self.fake_same_user, user)
 
 
+@mock.patch("cloudferrylib.os.identity.keystone.keystone_client.Client")
+class KeystoneClientTestCase(test.TestCase):
+    def test_adds_region_if_set_in_config(self, ks_client):
+        cloud = mock.MagicMock()
+        config = mock.MagicMock()
+
+        tenant = 'tenant'
+        region = 'region'
+        user = 'user'
+        auth_url = 'auth_url'
+        password = 'password'
+        insecure = False
+        cacert = ''
+
+        config.cloud.user = user
+        config.cloud.tenant = tenant
+        config.cloud.region = region
+        config.cloud.auth_url = auth_url
+        config.cloud.password = password
+        config.cloud.insecure = insecure
+        config.cloud.cacert = cacert
+
+        ks = keystone.KeystoneIdentity(config, cloud)
+        ks._get_client_by_creds()
+
+        ks_client.assert_called_with(
+            region_name=region,
+            tenant_name=tenant,
+            password=password,
+            auth_url=auth_url,
+            username=user,
+            cacert=cacert,
+            insecure=insecure
+        )
+
+    def test_does_not_add_region_if_not_set_in_config(self, ks_client):
+        cloud = mock.MagicMock()
+        config = mock.MagicMock()
+
+        tenant = 'tenant'
+        user = 'user'
+        auth_url = 'auth_url'
+        password = 'password'
+        insecure = False
+        cacert = ''
+
+        config.cloud.region = None
+        config.cloud.user = user
+        config.cloud.tenant = tenant
+        config.cloud.auth_url = auth_url
+        config.cloud.password = password
+        config.cloud.insecure = insecure
+        config.cloud.cacert = cacert
+
+        ks = keystone.KeystoneIdentity(config, cloud)
+        ks._get_client_by_creds()
+
+        ks_client.assert_called_with(
+            tenant_name=tenant,
+            password=password,
+            auth_url=auth_url,
+            username=user,
+            cacert=cacert,
+            insecure=insecure,
+            region_name=None
+        )
+
+
 class AddAdminToNonAdminTenantTestCase(test.TestCase):
     def test_user_role_is_removed_on_scope_exit(self):
         ksclient = mock.MagicMock()
+        member_role = mock.Mock()
+        member_role.name = 'admin'
+        user = mock.MagicMock()
+        user.name = 'adm'
+        tenant = mock.MagicMock()
+        tenant.name = 'tenant'
+        ksclient.roles.list.return_value = [member_role]
+        ksclient.users.list.return_value = [user]
+        ksclient.tenants.list.return_value = [tenant]
+        ksclient.roles.roles_for_user.return_value = []
 
         with keystone.AddAdminUserToNonAdminTenant(ksclient, 'adm', 'tenant'):
             pass
@@ -436,8 +549,14 @@ class AddAdminToNonAdminTenantTestCase(test.TestCase):
         role_name = 'member'
         member_role = mock.Mock()
         member_role.name = role_name
+        user = mock.MagicMock()
+        user.name = 'adm'
+        tenant = mock.MagicMock()
+        tenant.name = 'tenant'
+        ksclient.roles.list.return_value = [member_role]
+        ksclient.users.list.return_value = [user]
+        ksclient.tenants.list.return_value = [tenant]
         ksclient.roles.roles_for_user.return_value = [member_role]
-        ksclient.roles.find.return_value = member_role
 
         with keystone.AddAdminUserToNonAdminTenant(ksclient,
                                                    'adm',

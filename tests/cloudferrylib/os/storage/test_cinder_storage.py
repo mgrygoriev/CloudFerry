@@ -19,6 +19,7 @@ from cinderclient.v1 import client as cinder_client
 from oslotest import mockpatch
 
 from cloudferrylib.os.storage import cinder_storage
+from cloudferrylib.os.storage import filters
 from cloudferrylib.utils import utils
 from tests import test
 
@@ -28,13 +29,16 @@ FAKE_CONFIG = utils.ext_dict(
                           'password': 'fake_password',
                           'tenant': 'fake_tenant',
                           'host': '1.1.1.1',
-                          'auth_url': 'http://1.1.1.1:35357/v2.0/'}),
-    migrate=utils.ext_dict({'speed_limit': '10MB',
-                            'retry': '7',
+                          'ssh_host': '1.1.1.10',
+                          'auth_url': 'http://1.1.1.1:35357/v2.0/',
+                          'region': None,
+                          'cacert': '',
+                          'insecure': False}),
+    migrate=utils.ext_dict({'retry': '7',
                             'time_wait': 5,
                             'keep_volume_storage': False,
                             'keep_volume_snapshots': False}),
-    mysql=utils.ext_dict({'host': '1.1.1.1'}),
+    mysql=utils.ext_dict({'db_host': '1.1.1.1'}),
     storage=utils.ext_dict({'backend': 'ceph',
                             'rbd_pool': 'volumes',
                             'volume_name_template': 'volume-',
@@ -43,7 +47,7 @@ FAKE_CONFIG = utils.ext_dict(
 
 class CinderStorageTestCase(test.TestCase):
     def setUp(self):
-        super(CinderStorageTestCase, self).setUp()
+        test.TestCase.setUp(self)
         self.mock_client = mock.Mock()
         self.cs_patch = mockpatch.PatchObject(cinder_client, 'Client',
                                               new=self.mock_client)
@@ -58,13 +62,20 @@ class CinderStorageTestCase(test.TestCase):
         self.fake_cloud.resources = dict(identity=self.identity_mock,
                                          compute=self.compute_mock)
 
-        with mock.patch(
-                'cloudferrylib.os.storage.cinder_storage.mysql_connector'):
-            self.cinder_client = cinder_storage.CinderStorage(FAKE_CONFIG,
-                                                              self.fake_cloud)
+        self.cinder_client = cinder_storage.CinderStorage(
+            FAKE_CONFIG, self.fake_cloud)
+
+        filter_yaml = mock.Mock()
+        filter_yaml.get_tenant.return_value = None
+        filter_yaml.get_volume_ids.return_value = []
+        filter_yaml.get_volume_date.return_value = None
+        self.cinder_client.volume_filter = \
+            filters.CinderFilters(self.cinder_client, filter_yaml=filter_yaml)
 
         self.fake_volume_0 = mock.Mock()
+        self.fake_volume_0.status = 'available'
         self.fake_volume_1 = mock.Mock()
+        self.fake_volume_1.status = 'available'
 
         self.mock_client().volumes.get.return_value = self.fake_volume_0
 
@@ -76,7 +87,9 @@ class CinderStorageTestCase(test.TestCase):
 
         self.mock_client.assert_called_once_with('fake_user', 'fake_password',
                                                  'fake_tenant',
-                                                 'http://1.1.1.1:35357/v2.0/')
+                                                 'http://1.1.1.1:35357/v2.0/',
+                                                 cacert='', insecure=False,
+                                                 region_name=None)
         self.assertEqual(self.mock_client(), client)
 
     def test_get_volumes_list(self):
@@ -85,7 +98,8 @@ class CinderStorageTestCase(test.TestCase):
 
         volumes_list = self.cinder_client.get_volumes_list(search_opts=dict())
 
-        self.mock_client().volumes.list.assert_called_once_with(True, dict(all_tenants=True))
+        self.mock_client().volumes.list.\
+            assert_called_once_with(True, dict(all_tenants=True))
         self.assertEqual(volumes_list, fake_volume_list)
 
     def test_create_volume(self):
@@ -173,7 +187,8 @@ class CinderStorageTestCase(test.TestCase):
                          availability_zone='availability_zone',
                          volume_type='volume_type',
                          attachments=[{'device': 'device'}],
-                         bootable='bootable')
+                         bootable='bootable',
+                         status='available')
         self.cinder_client.get_volumes_list.return_value = [vol1]
         res = self.cinder_client.read_info(id="id1")
         self.assertIn('volumes', res)
@@ -228,7 +243,7 @@ class CinderStorageTestCase(test.TestCase):
 
         try:
             self.cinder_client.get_volume_path_iscsi('fake_vol_id')
-        except Exception as e:
+        except Exception as e:  # pylint: disable=broad-except
             self.assertEqual(expected_msg, e.message)
 
         self.fake_cloud.mysql_connector.execute.assert_called_once_with(
@@ -237,3 +252,39 @@ class CinderStorageTestCase(test.TestCase):
         self.assertRaises(Exception,
                           self.cinder_client.get_volume_path_iscsi,
                           'fake_vol_id')
+
+    def test_convert_volume(self):
+        vol = mock.Mock(id="id1",
+                        size=1024,
+                        display_name='display_name',
+                        display_description='display_description',
+                        availability_zone='availability_zone',
+                        volume_type='volume_type',
+                        attachments=[{'device': 'sdb'}],
+                        bootable='true',
+                        metadata={'data': 'data'},
+                        volume_image_metadata={'image_id': 'id',
+                                               'checksum': 'checksum',
+                                               'image_name': 'name',
+                                               'size': '1024'})
+        setattr(vol, 'os-vol-tenant-attr:tenant_id', 'tenant_id')
+
+        converted_vol = {'id': "id1",
+                         'size': 1024,
+                         'display_name': 'display_name',
+                         'display_description': 'display_description',
+                         'availability_zone': 'availability_zone',
+                         'volume_type': 'volume_type',
+                         'bootable': True,
+                         'project_id': 'tenant_id',
+                         'path': None,
+                         'host': None,
+                         'device': 'sdb',
+                         'metadata': {'data': 'data'},
+                         'volume_image_metadata': {'image_id': 'id',
+                                                   'checksum': 'checksum',
+                                                   'image_name': 'name',
+                                                   'size': 1024}}
+        vol = self.cinder_client.convert_volume(vol, mock.Mock(),
+                                                self.fake_cloud)
+        self.assertEqual(converted_vol, vol)

@@ -15,19 +15,23 @@
 
 import multiprocessing
 
+from fabric import api
+
 from cloudferrylib.scheduler.namespace import Namespace, CHILDREN
-from cloudferrylib.utils import utils
+from cloudferrylib.utils.errorcodes import NO_ERROR, \
+    ERROR_INVALID_CONFIGURATION, ERROR_DURING_ROLLBACK, \
+    ERROR_MIGRATION_FAILED, ERROR_INITIAL_CHECK
+from cloudferrylib.utils import log
 from cursor import Cursor
 import signal_handler
 from task import BaseTask
 from thread_tasks import WrapThreadTask
+import oslo_config.cfg
+LOG = log.getLogger(__name__)
 
-
-LOG = utils.get_log(__name__)
-
-
-NO_ERROR = 0
-ERROR = 255
+STEP_PREPARATION = "PREPARATION"
+STEP_MIGRATION = "MIGRATION"
+STEP_ROLLBACK = "ROLLBACK"
 
 
 class BaseScheduler(object):
@@ -44,11 +48,13 @@ class BaseScheduler(object):
         self.map_func_task[BaseTask()] = self.task_run
 
     def event_start_task(self, task):
-        LOG.info('%s Start task: %s', '-' * 8, task)
+        api.env.current_task = task
+        LOG.info("Start task '%s'", task)
         return True
 
     def event_end_task(self, task):
-        LOG.info('%s End task: %s', '-' * 8, task)
+        LOG.info("End task '%s'", task)
+        api.env.current_task = None
         return True
 
     def event_error_task(self, task, e):
@@ -70,7 +76,14 @@ class BaseScheduler(object):
                 try:
                     self.run_task(task)
                 except Exception as e:
-                    self.status_error = ERROR
+                    if chain_name == STEP_PREPARATION:
+                        self.status_error = ERROR_INITIAL_CHECK
+                    if chain_name == STEP_MIGRATION:
+                        self.status_error = ERROR_MIGRATION_FAILED
+                    if chain_name == STEP_ROLLBACK:
+                        self.status_error = ERROR_DURING_ROLLBACK
+                    if isinstance(e, oslo_config.cfg.Error):
+                        self.status_error = ERROR_INVALID_CONFIGURATION
                     self.exception = e
                     self.error_task(task, e)
                     LOG.info("Failed processing CHAIN %s", chain_name)
@@ -80,15 +93,15 @@ class BaseScheduler(object):
 
     def start(self):
         # try to prepare for migration
-        self.process_chain(self.preparation, "PREPARATION")
+        self.process_chain(self.preparation, STEP_PREPARATION)
         # if we didn't get error during preparation task - process migration
-        if self.status_error != ERROR:
+        if self.status_error == NO_ERROR:
             with signal_handler.IgnoreInterruptHandler():
                 with signal_handler.InterruptHandler():
-                    self.process_chain(self.migration, "MIGRATION")
+                    self.process_chain(self.migration, STEP_MIGRATION)
                 # if we had an error during process migration - rollback
-                if self.status_error == ERROR:
-                    self.process_chain(self.rollback, "ROLLBACK")
+                if self.status_error != NO_ERROR:
+                    self.process_chain(self.rollback, STEP_ROLLBACK)
 
     def task_run(self, task):
         task(namespace=self.namespace)

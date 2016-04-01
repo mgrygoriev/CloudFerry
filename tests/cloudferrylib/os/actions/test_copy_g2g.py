@@ -17,6 +17,7 @@
 import mock
 
 from cloudferrylib.os.actions import copy_g2g
+from cloudferrylib.utils import utils
 from tests import test
 
 
@@ -34,7 +35,8 @@ class CopyFromGlanceToGlanceTestCase(test.TestCase):
         self.dst_cloud = mock.Mock()
         self.dst_cloud.resources = {'image': self.fake_image}
 
-        self.fake_config = {}
+        self.fake_config = utils.ext_dict(migrate=utils.ext_dict(
+            {'ignore_empty_images': False}))
         self.src_cloud.resources = {'image': self.fake_image}
 
         self.fake_init = {
@@ -51,8 +53,7 @@ class CopyFromGlanceToGlanceTestCase(test.TestCase):
         self.assertEqual({'images_info': self.fake_result_info}, new_info)
 
         self.fake_image.deploy.assert_called_once_with(
-            {'images_info': self.fake_image.read_info()},
-            callback=copy_g2g.CopyFromGlanceToGlance.callback_print_progress)
+            {'images_info': self.fake_image.read_info()})
 
     @mock.patch('cloudferrylib.os.actions.get_info_images.GetInfoImages')
     def test_run_no_info(self, mock_info):
@@ -63,5 +64,4 @@ class CopyFromGlanceToGlanceTestCase(test.TestCase):
 
         self.assertEqual({'images_info': self.fake_result_info}, new_info)
         self.fake_image.deploy.assert_called_once_with(
-            {'image_data': {'fake_key': 'fake_value'}},
-            callback=copy_g2g.CopyFromGlanceToGlance.callback_print_progress)
+            {'image_data': {'fake_key': 'fake_value'}})

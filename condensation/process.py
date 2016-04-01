@@ -15,8 +15,10 @@ import cfglib
 
 from condensation import cloud
 from condensation import utils as condense_utils
-from cloudferrylib.utils import utils as utl
-LOG = utl.get_log(__name__)
+
+from cloudferrylib.utils import log
+
+LOG = log.getLogger(__name__)
 SOURCE = "source"
 DESTINATION = "destination"
 
@@ -29,12 +31,13 @@ def process(nodes, flavors, vms, groups):
     # read files with nova data and node data
     LOG.info("started creating schedule for node condensation")
 
-    source = cloud.Cloud.from_dicts('source',  nodes, flavors, vms, groups)
+    source = cloud.Cloud.from_dicts('source', nodes, flavors, vms, groups)
     source.migrate_to(cloud.Cloud('destination'))
 
 
 if __name__ == "__main__":
     process(nodes=condense_utils.read_file(cfglib.CONF.condense.nodes_file),
-            flavors=condense_utils.read_file(cfglib.CONF.condense.flavors_file),
+            flavors=condense_utils.read_file(
+                cfglib.CONF.condense.flavors_file),
             vms=condense_utils.read_file(cfglib.CONF.condense.vms_file),
             groups=condense_utils.read_file(cfglib.CONF.condense.groups_file))

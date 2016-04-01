@@ -1,43 +1,75 @@
 version: 1
+disable_existing_loggers: False
 formatters:
   simple:
     format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-  colored:
+  info_colored:
     (): colorlog.ColoredFormatter
-    format: '%(bg_black)s%(log_color)s%(levelname)-8s%(reset)s %(bg_blue)s[%(pathname)s : lineno %(lineno)s]%(reset)s %(bg_cyan)s %(asctime)s %(reset)s %(bg_black)s%(log_color)s%(message)s%(reset)s'
+    format: '%(log_color)s%(levelname)-8s%(reset)s %(current_task)s %(asctime)s %(message)s'
     datefmt: '%m-%d %H:%M:%S'
     log_colors:
       DEBUG: green
-      INFO: white
+      INFO: cyan
       WARNING: yellow
       ERROR: red
       CRITICAL: purple
+  debug_colored:
+    (): colorlog.ColoredFormatter
+    format: '%(log_color)s%(levelname)-8s%(reset)s %(current_task)s [%(name)s; %(pathname)s:%(lineno)s] %(asctime)s %(message)s'
+    datefmt: '%m-%d %H:%M:%S'
+    log_colors:
+      DEBUG: green
+      INFO: cyan
+      WARNING: yellow
+      ERROR: red
+      CRITICAL: purple
+  console_colored:
+    (): colorlog.ColoredFormatter
+    format: '%(log_color)s%(levelname)-8s%(reset)s %(current_task)s [%(pathname)s:%(lineno)s] %(asctime)s %(message)s'
+    datefmt: '%m-%d %H:%M:%S'
+    log_colors:
+      DEBUG: green
+      INFO: cyan
+      WARNING: yellow
+      ERROR: red
+      CRITICAL: purple
+filters:
+  show_current_task:
+    (): cloudferrylib.utils.log.CurrentTaskFilter
+    name_format: '%(name)s'
+
 handlers:
   console:
     class: logging.StreamHandler
-    level: DEBUG
-    formatter: colored
+    formatter: console_colored
     stream: ext://sys.stdout
+    filters: [show_current_task]
+    level: INFO
+  debug:
+    backupCount: 20
+    class: cloudferrylib.utils.log.RunRotatingFileHandler
+    encoding: utf-8
+    filename: 'debug-%(scenario)s-%(date)s.log'
+    date_format: '%F-%H-%M-%S'
+    formatter: debug_colored
+    level: NOTSET
+    maxBytes: 100M
+    filters: [show_current_task]
   info:
     backupCount: 20
-    class: logging.handlers.RotatingFileHandler
+    class: cloudferrylib.utils.log.RunRotatingFileHandler
     encoding: utf-8
-    filename: info.log
-    formatter: colored
+    filename: 'info-%(scenario)s-%(date)s.log'
+    date_format: '%F-%H-%M-%S'
+    formatter: info_colored
     level: INFO
-    maxBytes: 10485760
-  error:
-    backupCount: 20
-    class: logging.handlers.RotatingFileHandler
-    encoding: utf-8
-    filename: errors.log
-    formatter: colored
-    level: ERROR
-    maxBytes: 10485760
+    maxBytes: 100M
+    filters: [show_current_task]
 loggers:
-  CF:
-    level: INFO
-    handlers: [console, info, error]
+  cloudferrylib:
+    level: DEBUG
+    handlers: [console, info]
+
 root:
-  level: INFO
-  handlers: []
+  level: NOTSET
+  handlers: [debug]

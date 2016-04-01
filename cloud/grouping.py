@@ -18,10 +18,11 @@ import cloud
 from cloudferrylib.os.identity import keystone
 from cloudferrylib.os.network import neutron
 from cloudferrylib.os.compute import nova_compute
+from cloudferrylib.utils import log
 from cloudferrylib.utils import utils
 
 
-LOG = utils.get_log(__name__)
+LOG = log.getLogger(__name__)
 
 
 class Grouping(object):
@@ -90,15 +91,20 @@ class Grouping(object):
     def _group_nested_network(self, instances_list=None):
         groups = {}
 
+        networks_list = self.network.get_networks_list()
+        subnets_list = self.network.get_subnets_list()
+
         search_list = (instances_list if instances_list else
                        self.compute.get_instances_list(
                            search_opts={"all_tenants": True}))
         for instance in search_list:
             LOG.info('Processing instance %s', instance.name)
             for (network_name, network_ips) in instance.networks.items():
-                network = self.network.get_network({'ip': network_ips[0]},
-                                                   instance.tenant_id,
-                                                   True)
+                network = neutron.get_network_from_list(
+                    ip=network_ips[0],
+                    tenant_id=instance.tenant_id,
+                    networks_list=networks_list,
+                    subnets_list=subnets_list)
                 network_id = network['id']
                 if network_id in groups:
                     groups[network_id].append(instance)

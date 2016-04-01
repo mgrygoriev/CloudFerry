@@ -14,12 +14,12 @@
 
 
 import copy
-from neutronclient.common import exceptions as neutronclient_exceptions
 
 from cloudferrylib.base.action import action
+from cloudferrylib.utils import log
 from cloudferrylib.utils import utils as utl
 
-LOG = utl.get_log(__name__)
+LOG = log.getLogger(__name__)
 
 
 class PrepareNetworks(action.Action):
@@ -64,27 +64,22 @@ class PrepareNetworks(action.Action):
             for src_net in networks_info:
                 dst_net = network_resource.get_network(src_net, tenant_id,
                                                        keep_ip)
-                port_id = network_resource.check_existing_port(dst_net['id'],
-                                                               src_net['mac'])
-                if port_id:
-                    network_resource.delete_port(port_id)
+                mac_address = src_net['mac_address']
+                ip_addresses = src_net['ip_addresses']
+                for ip_address in ip_addresses:
+                    port_dict = network_resource.check_existing_port(
+                        dst_net['id'], mac_address, ip_address)
+                    if port_dict:
+                        network_resource.delete_port(port_dict['id'])
                 sg_ids = []
                 for sg in network_resource.get_security_groups():
                     if sg['tenant_id'] == tenant_id:
                         if sg['name'] in security_groups:
                             sg_ids.append(sg['id'])
-                try:
-                    port = network_resource.create_port(dst_net['id'],
-                                                        src_net['mac'],
-                                                        src_net['ip'],
-                                                        tenant_id,
-                                                        keep_ip,
-                                                        sg_ids)
-                except neutronclient_exceptions.IpAddressInUseClient:
-                    LOG.warning("IP address '%s' on destination net '%s (%s)' "
-                                "already exists!",
-                                src_net['ip'], dst_net['name'], dst_net['id'])
-                    continue
+
+                port = network_resource.create_port(
+                    dst_net['id'], mac_address, ip_addresses, tenant_id,
+                    keep_ip, sg_ids, src_net['allowed_address_pairs'])
                 fip = None
                 src_fip = src_net['floatingip']
                 if src_fip:

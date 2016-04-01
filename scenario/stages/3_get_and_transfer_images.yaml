@@ -1,0 +1,20 @@
+# Stage to migrate glance resources such as images, snapshots and image
+# members.
+
+preparation:
+  - print_info:
+      - print_configuration: True
+      - print_scenario: True
+      - print_filter: True
+  - create_snapshot: True
+  - create_image_snapshot_dst: True
+
+rollback:
+  - restore_from_snapshot: True
+  - image_rollback_dst: True
+
+process:
+  - act_get_filter: True
+  - act_check_filter: True
+  - act_get_info_images: True
+  - act_deploy_images: True

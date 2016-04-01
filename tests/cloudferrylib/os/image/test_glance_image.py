@@ -26,21 +26,26 @@ from tests import test
 FAKE_CONFIG = utils.ext_dict(cloud=utils.ext_dict({'user': 'fake_user',
                                                    'password': 'fake_password',
                                                    'tenant': 'fake_tenant',
+                                                   'region': None,
                                                    'host': '1.1.1.1',
+                                                   'ssh_host': '1.1.1.10',
+                                                   'ssh_user': 'fake_user',
+                                                   'cacert': '',
+                                                   'insecure': False
                                                    }),
-                             migrate=utils.ext_dict({'speed_limit': '10MB',
-                                                     'retry': '7',
+                             migrate=utils.ext_dict({'retry': '7',
                                                      'time_wait': 5}))
 
 
-class FakeUser():
+class FakeUser(object):
     def __init__(self):
         self.name = 'fake_user_name'
+
 
 class GlanceImageTestCase(test.TestCase):
 
     def setUp(self):
-        super(GlanceImageTestCase, self).setUp()
+        test.TestCase.setUp(self)
 
         self.glance_mock_client = mock.MagicMock()
         self.glance_mock_client().images.data()._resp = 'fake_resp_1'
@@ -67,11 +72,11 @@ class GlanceImageTestCase(test.TestCase):
 
         self.fake_cloud.resources = dict(identity=self.identity_mock,
                                          image=self.image_mock)
-        with mock.patch(
-                'cloudferrylib.os.image.glance_image.mysql_connector'):
-            self.glance_image = GlanceImage(FAKE_CONFIG, self.fake_cloud)
+        self.fake_cloud.mysql_connector = mock.MagicMock()
 
-        self.fake_image_1 = mock.Mock()
+        self.glance_image = GlanceImage(FAKE_CONFIG, self.fake_cloud)
+
+        self.fake_image_1 = mock.MagicMock()
 
         values_dict = {
             'id': 'fake_image_id_1',
@@ -85,13 +90,16 @@ class GlanceImageTestCase(test.TestCase):
             'protected': False,
             'size': 1024,
             'properties': {},
+            'deleted': False,
         }
         for k, w in values_dict.items():
             setattr(self.fake_image_1, k, w)
         self.fake_image_1.to_dict = mock.Mock(return_value=values_dict)
+        self.fake_image_1.deleted = False
 
         self.fake_image_2 = mock.Mock()
         self.fake_image_2.name = 'fake_image_name_2'
+        self.fake_image_2.deleted = False
 
         self.fake_input_info = {'images': {}}
 
@@ -102,14 +110,21 @@ class GlanceImageTestCase(test.TestCase):
                                               'disk_format': 'qcow2',
                                               'id': 'fake_image_id_1',
                                               'is_public': True,
+                                              'location': None,
                                               'owner': 'fake_tenant_id',
                                               'owner_name': 'fake_tenant_name',
                                               'name': 'fake_image_name_1',
                                               'protected': False,
                                               'size': 1024,
                                               'resource': self.image_mock,
-                                              'properties': {'user_name': 'fake_user_name'}},
-                                    'meta': {}}},
+                                              'members': {},
+                                              'properties': {},
+                                              'copy_from': None,
+                                              'min_disk': None,
+                                              'min_ram': None,
+                                              'store': None,
+                                              'deleted': False},
+                                    'meta': {'img_loc': None}}},
             'tags': {},
             'members': {}
         }
@@ -123,7 +138,8 @@ class GlanceImageTestCase(test.TestCase):
             fake_auth_token)
 
         gl_client = self.glance_image.get_client()
-        mock_calls = [mock.call(endpoint=fake_endpoint, token=fake_auth_token)]
+        mock_calls = [mock.call(endpoint=fake_endpoint, token=fake_auth_token,
+                                insecure=FAKE_CONFIG.cloud.insecure)]
 
         self.glance_mock_client.assert_has_calls(mock_calls)
         self.assertEqual(self.glance_mock_client(), gl_client)
@@ -133,7 +149,8 @@ class GlanceImageTestCase(test.TestCase):
         self.glance_mock_client().images.list.return_value = fake_images
 
         images_list = self.glance_image.get_image_list()
-        self.glance_mock_client().images.list.assert_called_once_with(filters={'is_public': None})
+        self.glance_mock_client().images.list.assert_called_once_with(
+            filters={'is_public': None})
         self.assertEquals(fake_images, images_list)
 
     def test_create_image(self):
@@ -149,12 +166,13 @@ class GlanceImageTestCase(test.TestCase):
         fake_image_id = 'fake_image_id_1'
         self.glance_image.delete_image(fake_image_id)
 
+        self.glance_mock_client().images.update.assert_called_once_with(
+            fake_image_id, protected=False)
         self.glance_mock_client().images.delete.assert_called_once_with(
             fake_image_id)
 
     def test_get_image_by_id(self):
-        fake_images = [self.fake_image_1, self.fake_image_2]
-        self.glance_mock_client().images.list.return_value = fake_images
+        self.glance_mock_client().images.get.return_value = self.fake_image_1
 
         self.assertEquals(self.fake_image_1,
                           self.glance_image.get_image_by_id('fake_image_id_1'))
@@ -178,8 +196,7 @@ class GlanceImageTestCase(test.TestCase):
                           self.glance_image.get_image('fake_image_name_2'))
 
     def test_get_image_status(self):
-        fake_images = [self.fake_image_1, self.fake_image_2]
-        self.glance_mock_client().images.list.return_value = fake_images
+        self.glance_mock_client().images.get.return_value = self.fake_image_1
 
         self.assertEquals(self.fake_image_1.status,
                           self.glance_image.get_image_status(
@@ -193,8 +210,7 @@ class GlanceImageTestCase(test.TestCase):
                           self.glance_image.get_ref_image('fake_image_id_1'))
 
     def test_get_image_checksum(self):
-        fake_images = [self.fake_image_1, self.fake_image_2]
-        self.glance_mock_client().images.list.return_value = fake_images
+        self.glance_mock_client().images.get.return_value = self.fake_image_1
 
         self.assertEquals(self.fake_image_1.checksum,
                           self.glance_image.get_image_checksum(
@@ -239,3 +255,30 @@ class GlanceImageTestCase(test.TestCase):
 
         info = self.glance_image.read_info()
         self.assertEqual(self.fake_result_info, info)
+
+    def test_get_matching_image_positive_match_uuid(self):
+        fake_images = [self.fake_image_1, self.fake_image_2]
+        self.glance_mock_client().images.list.return_value = fake_images
+
+        img = self.glance_image.get_matching_image(
+            uuid=self.fake_image_1.id, checksum='mismatch_checksum',
+            size=2048, name='mismatch_name')
+        self.assertEqual(self.fake_image_1, img)
+
+    def test_get_matching_image_positive_mismatch_uuid(self):
+        fake_images = [self.fake_image_1, self.fake_image_2]
+        self.glance_mock_client().images.list.return_value = fake_images
+
+        img = self.glance_image.get_matching_image(
+            uuid='mismatching', checksum=self.fake_image_1.checksum,
+            size=self.fake_image_1.size, name=self.fake_image_1.name)
+        self.assertEqual(self.fake_image_1, img)
+
+    def test_get_matching_image_negative(self):
+        fake_images = [self.fake_image_1, self.fake_image_2]
+        self.glance_mock_client().images.list.return_value = fake_images
+
+        img = self.glance_image.get_matching_image(
+            uuid='mismatching', checksum='mismatch_checksum',
+            size=2048, name='mismatch_name')
+        self.assertEqual(None, img)

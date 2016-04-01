@@ -28,17 +28,23 @@ class NovaNetwork(network.Network):
     def __init__(self, config, cloud):
         super(NovaNetwork, self).__init__(config)
         self.cloud = cloud
+        self.mysql_connector = cloud.mysql_connector('nova')
 
     @property
     def nova_client(self):
         return self.proxy(self.get_client(), self.config)
 
     def get_client(self):
+
         return nova_client.Client(
             self.config.cloud.user,
             self.config.cloud.password,
             self.config.cloud.tenant,
-            self.config.cloud.auth_url)
+            self.config.cloud.auth_url,
+            cacert=self.config.cloud.cacert,
+            insecure=self.config.cloud.insecure,
+            region_name=self.config.cloud.region
+        )
 
     def read_info(self, opts=None):
         opts = {} if not opts else opts
@@ -83,8 +89,10 @@ class NovaNetwork(network.Network):
     def get_mac_addresses(self, instance):
         compute_node = getattr(instance, nova_compute.INSTANCE_HOST_ATTRIBUTE)
         libvirt_name = getattr(instance, 'OS-EXT-SRV-ATTR:instance_name')
+        ssh_attempts = self.config.migrate.ssh_connection_attempts
 
-        with settings(host_string=self.config['host']):
+        with settings(host_string=self.config.ssh_host,
+                      connection_attempts=ssh_attempts):
             with forward_agent(env.key_filename):
                 cmd = "virsh dumpxml %s | grep 'mac address' | " \
                       "cut -d\\' -f2" % libvirt_name
